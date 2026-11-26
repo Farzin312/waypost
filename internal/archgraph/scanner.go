@@ -9,14 +9,17 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Farzin312/waypost/internal/compmap"
+	"github.com/Farzin312/waypost/internal/repoview"
 )
 
-const maxSourceFileBytes = 1024 * 1024
+const MaxSourceFileBytes = 1024 * 1024
+const maxSourceFileBytes = MaxSourceFileBytes
 
 // RawImport represents one statically resolved intra-repository import.
 type RawImport struct {
@@ -66,6 +69,10 @@ type scanResult struct {
 // AnalyzeOptions optionally restricts scanning to a repository-relative file inventory.
 // A nil allowlist scans the live tree.
 type AnalyzeOptions struct {
+	// ResolutionView supplies the trusted alias and module definitions for an
+	// independent scan of the same source view.
+	ResolutionView      *repoview.View
+	View                *repoview.View
 	AllowedFiles        map[string]bool
 	SkipNonRegularFiles bool                                        // Inference only needs materialized regular inputs.
 	AllowMissingFiles   bool                                        // Local inventories can include files deleted from the worktree.
@@ -78,6 +85,9 @@ type goModuleInfo struct {
 }
 
 func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts AnalyzeOptions) (scanResult, error) {
+	if opts.View != nil {
+		opts.AllowedFiles = opts.View.Inventory()
+	}
 	resolved, err := filepath.EvalSymlinks(repo)
 	if err != nil {
 		return scanResult{}, err
@@ -100,19 +110,39 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 		result.errors = append(result.errors, fmt.Sprintf("%s: %v", rel, err))
 	}
 
+	ignoreGlobs := compmap.CompileGlobs(ignore)
+	read := func(rel string, limit int) ([]byte, error) {
+		if opts.View != nil {
+			return opts.View.Read(rel, limit)
+		}
+		return compmap.ReadBoundedRegularFile(repo, filepath.Join(repo, rel), limit)
+	}
+	resolutionRead, resolutionFiles := read, opts.AllowedFiles
+	if opts.ResolutionView != nil {
+		resolutionRead, resolutionFiles = opts.ResolutionView.Read, opts.ResolutionView.Inventory()
+	}
 	scanFile := func(rel string) {
-		if compmap.MatchAnyGlob(ignore, rel) {
+		if compmap.MatchCompiled(ignoreGlobs, rel) {
 			return
 		}
 		dir, base := path.Dir(rel), path.Base(rel)
+		metadata := isResolutionInput(rel)
+		if metadata && opts.ResolutionView != nil {
+			return
+		}
 		if opts.SkipNonRegularFiles {
-			if info, err := os.Lstat(filepath.Join(repo, rel)); err == nil && !info.Mode().IsRegular() {
+			if opts.View != nil {
+				if !opts.View.Files[rel].Regular() {
+					return
+				}
+			} else if info, err := os.Lstat(filepath.Join(repo, rel)); err == nil && !info.Mode().IsRegular() {
 				return
 			}
 		}
+
 		switch base {
 		case "tsconfig.json", "tsconfig.base.json", "jsconfig.json":
-			if opts.AllowMissingFiles {
+			if opts.AllowMissingFiles && opts.View == nil {
 				if _, err := os.Lstat(filepath.Join(repo, rel)); errors.Is(err, os.ErrNotExist) {
 					return
 				}
@@ -123,24 +153,63 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 			}
 			return
 		}
-		if !isSupportedSource(rel) && base != "go.mod" && base != "Cargo.toml" {
+		if !IsSupportedSource(rel) && base != "go.mod" && base != "Cargo.toml" {
 			return
 		}
-		src, err := compmap.ReadBoundedRegularFile(repo, filepath.Join(repo, rel), maxSourceFileBytes)
-		if err != nil {
-			if !opts.AllowMissingFiles || !errors.Is(err, os.ErrNotExist) {
-				addError(rel, err)
+		ext := strings.ToLower(path.Ext(rel))
+		var refs []parsedRef
+		var name string
+		isManifest := base == "go.mod" || base == "Cargo.toml"
+		cached := false
+		if opts.View != nil {
+			if isManifest {
+				cached = opts.View.CachedParse(rel, base, &name)
+			} else {
+				cached = opts.View.CachedParse(rel, ext, &refs)
 			}
-			return
 		}
+		if !cached {
+			src, err := read(rel, maxSourceFileBytes)
+			if err != nil {
+				if !isManifest && isOversizedFileError(err) && cm != nil && len(cm.Components) > 0 && primaryOwnerOf(cm, rel) == "" {
+					return
+				}
+				if !opts.AllowMissingFiles || !errors.Is(err, os.ErrNotExist) {
+					addError(rel, err)
+				}
+				return
+			}
+			switch {
+			case base == "go.mod":
+				name = goModulePath(src)
+			case base == "Cargo.toml":
+				name = rustCrateName(src)
+			case ext == ".go":
+				refs = extractGoImports(rel, src)
+			case ext == ".py":
+				refs = extractPythonImports(src)
+			case ext == ".rs":
+				refs = extractRustImports(src)
+			default:
+				refs = extractTSImports(src)
+			}
+			if opts.View != nil {
+				if isManifest {
+					opts.View.CacheParse(rel, base, name)
+				} else {
+					opts.View.CacheParse(rel, ext, refs)
+				}
+			}
+		}
+
 		switch base {
 		case "go.mod":
-			if mod := goModulePath(src); mod != "" {
+			if mod := name; mod != "" {
 				goModules = append(goModules, goModuleInfo{dirRel: dir, modulePath: mod})
 			}
 			return
 		case "Cargo.toml":
-			if name := rustCrateName(src); name != "" {
+			if name != "" {
 				if _, exists := rustCrates[name]; !exists {
 					rustCrates[name] = path.Join(dir, "src")
 				}
@@ -148,17 +217,10 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 			return
 		}
 		result.files[rel] = true
-		switch strings.ToLower(path.Ext(rel)) {
-		case ".go":
+		if ext == ".go" {
 			result.goPackages[dir] = append(result.goPackages[dir], rel)
-			refsByFile[rel] = extractGoImports(rel, src)
-		case ".py":
-			refsByFile[rel] = extractPythonImports(src)
-		case ".rs":
-			refsByFile[rel] = extractRustImports(src)
-		default:
-			refsByFile[rel] = extractTSImports(src)
 		}
+		refsByFile[rel] = refs
 	}
 
 	if opts.AllowedFiles != nil {
@@ -171,21 +233,24 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 				addError(rel, errors.New("invalid repository-relative path"))
 				continue
 			}
-			skip := false
-			for dir := path.Dir(rel); dir != "."; dir = path.Dir(dir) {
-				value, cached := skipped[dir]
-				if !cached {
-					value = skipScanDir(cm, dir)
-					skipped[dir] = value
+			if opts.View == nil || opts.View.Kind != "commit" {
+				skip := false
+				for dir := path.Dir(rel); dir != "."; dir = path.Dir(dir) {
+					value, cached := skipped[dir]
+					if !cached {
+						value = skipScanDir(cm, dir)
+						skipped[dir] = value
+					}
+					if value {
+						skip = true
+						break
+					}
 				}
-				if value {
-					skip = true
-					break
+				if skip && !declaredScanPath(cm, rel) {
+					continue
 				}
 			}
-			if !skip {
-				scanFile(rel)
-			}
+			scanFile(rel)
 		}
 	} else {
 		err = filepath.WalkDir(repo, func(full string, d fs.DirEntry, walkErr error) error {
@@ -202,10 +267,15 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 				return nil
 			}
 			if d.IsDir() {
-				if rel != "." && skipScanDir(cm, rel) {
+				if rel != "." && (path.Base(rel) == ".git" || skipScanDir(cm, rel) && !hasDeclaredScanGlobs(cm)) {
 					return filepath.SkipDir
 				}
 				return nil
+			}
+			for dir := path.Dir(rel); dir != "."; dir = path.Dir(dir) {
+				if skipScanDir(cm, dir) && !declaredScanPath(cm, rel) {
+					return nil
+				}
 			}
 			scanFile(rel)
 			return nil
@@ -215,8 +285,50 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 		}
 	}
 
+	if rv := opts.ResolutionView; rv != nil {
+		for _, rel := range rv.Paths() {
+			if !isResolutionInput(rel) || compmap.MatchCompiled(ignoreGlobs, rel) {
+				continue
+			}
+			dir, base := path.Dir(rel), path.Base(rel)
+			switch base {
+			case "tsconfig.json", "tsconfig.base.json", "jsconfig.json":
+				if current := tsFiles[dir]; current == "" || tsConfigPriority(base) < tsConfigPriority(path.Base(current)) {
+					tsFiles[dir] = rel
+				}
+			case "go.mod", "Cargo.toml":
+				var name string
+				if !rv.CachedParse(rel, base, &name) {
+					data, err := rv.Read(rel, maxSourceFileBytes)
+					if err != nil {
+						addError(rel, err)
+						continue
+					}
+					if base == "go.mod" {
+						name = goModulePath(data)
+					} else {
+						name = rustCrateName(data)
+					}
+					rv.CacheParse(rel, base, name)
+				}
+				if name == "" {
+					continue
+				}
+				if base == "go.mod" {
+					goModules = append(goModules, goModuleInfo{dirRel: dir, modulePath: name})
+				} else if _, exists := rustCrates[name]; !exists {
+					rustCrates[name] = path.Join(dir, "src")
+				}
+			}
+		}
+	}
+
 	var tsConfigs []tsAliasConfig
-	loader := tsConfigLoader{repo: repo, ignore: ignore, allowedFiles: opts.AllowedFiles}
+	metadataView := opts.View
+	if opts.ResolutionView != nil {
+		metadataView = opts.ResolutionView
+	}
+	loader := tsConfigLoader{repo: repo, read: resolutionRead, ignore: ignore, allowedFiles: resolutionFiles, view: metadataView}
 	for _, rel := range tsFiles {
 		tc, err := loader.load(rel, nil)
 		if err != nil {
@@ -277,6 +389,15 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 	return result, nil
 }
 
+func isResolutionInput(rel string) bool {
+	switch path.Base(rel) {
+	case "go.mod", "Cargo.toml", "tsconfig.json", "tsconfig.base.json", "jsconfig.json":
+		return true
+	default:
+		return false
+	}
+}
+
 func validRepoPath(rel string) bool {
 	return rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") &&
 		!filepath.IsAbs(rel) && path.Clean(rel) == rel
@@ -294,7 +415,7 @@ func skipScanDir(cm *compmap.Map, dir string) bool {
 		if c.Provenance != compmap.ProvenanceDeclared {
 			continue
 		}
-		if c.Root == dir || strings.HasPrefix(c.Root, dir+"/") {
+		if c.Root == "." && len(c.Paths) == 0 || c.Root == dir || strings.HasPrefix(c.Root, dir+"/") || strings.HasPrefix(dir, c.Root+"/") {
 			return false
 		}
 		for _, glob := range c.Paths {
@@ -309,6 +430,21 @@ func skipScanDir(cm *compmap.Map, dir string) bool {
 	return true
 }
 
+func hasDeclaredScanGlobs(cm *compmap.Map) bool {
+	return slices.ContainsFunc(cm.Components, func(c compmap.Component) bool {
+		return c.Provenance == compmap.ProvenanceDeclared && len(c.Paths) > 0
+	})
+}
+
+func declaredScanPath(cm *compmap.Map, rel string) bool {
+	for _, c := range cm.Components {
+		if c.Provenance == compmap.ProvenanceDeclared && (c.Root == "." && len(c.Paths) == 0 || strings.HasPrefix(rel, c.Root+"/") || compmap.MatchAnyGlob(c.Paths, rel)) {
+			return true
+		}
+	}
+	return false
+}
+
 func isJSSource(rel string) bool {
 	switch strings.ToLower(path.Ext(rel)) {
 	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts":
@@ -317,13 +453,7 @@ func isJSSource(rel string) bool {
 	return false
 }
 
-func isSupportedSource(rel string) bool {
-	switch strings.ToLower(path.Ext(rel)) {
-	case ".go", ".py", ".rs":
-		return true
-	}
-	return isJSSource(rel)
-}
+func IsSupportedSource(rel string) bool { return SourceLanguage(rel) != "" }
 
 func resolveTSImport(fromFile, spec string, tc *tsAliasConfig, fileSet map[string]bool) string {
 	// Strip query/hash suffixes (e.g. ?raw).
@@ -485,21 +615,33 @@ func WalkSourceFiles(repo string, cm *compmap.Map, ignore []string, visit func(r
 			}
 			return nil
 		}
-		if !entry.Type().IsRegular() || !isSupportedSource(rel) || compmap.MatchAnyGlob(ignore, rel) {
+		if !entry.Type().IsRegular() || !IsSupportedSource(rel) || compmap.MatchAnyGlob(ignore, rel) {
 			return nil
 		}
-		language := "javascript"
-		switch strings.ToLower(path.Ext(rel)) {
-		case ".ts", ".tsx", ".mts", ".cts":
-			language = "typescript"
-		case ".go":
-			language = "go"
-		case ".py":
-			language = "python"
-		case ".rs":
-			language = "rust"
-		}
-		visit(rel, language)
+		visit(rel, SourceLanguage(rel))
 		return nil
 	})
+}
+
+// SourceLanguage returns the language used by the static source scanner.
+func SourceLanguage(rel string) string {
+	switch strings.ToLower(path.Ext(rel)) {
+	case ".ts", ".tsx", ".mts", ".cts":
+		return "typescript"
+	case ".go":
+		return "go"
+	case ".py":
+		return "python"
+	case ".rs":
+		return "rust"
+	default:
+		if isJSSource(rel) {
+			return "javascript"
+		}
+		return ""
+	}
+}
+
+func isOversizedFileError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "exceeds ")
 }

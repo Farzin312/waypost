@@ -78,6 +78,12 @@ func TestBaselineReadsLegacyCycleAndImplicitCounts(t *testing.T) {
 			t.Fatal(err)
 		}
 		baseline, err := ParseBaseline(raw)
+		if count < 0 {
+			if err == nil || !strings.Contains(err.Error(), "negative count") {
+				t.Fatalf("expected rejection of negative count: %v", err)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,5 +164,81 @@ func TestBaselineEditRejectsSubstitutionThroughInRepoSymlink(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(filepath.Join(dir, ".git/config")); err != nil || string(raw) != "keep untouched" {
 		t.Fatalf("Git metadata changed: %q, %v", raw, err)
+	}
+}
+
+func TestCycleRatchetAllowsDisjointStructuralSplits(t *testing.T) {
+	v := func(members []string, edges ...CycleEdge) Violation {
+		return Violation{Kind: "cycle", RuleID: "no-cycles", From: members[0], CycleMembers: members, CycleEdges: edges}
+	}
+	left := v([]string{"a", "b"}, CycleEdge{"a", "b"}, CycleEdge{"b", "a"})
+	right := v([]string{"c", "d"}, CycleEdge{"c", "d"}, CycleEdge{"d", "c"})
+	var edges []CycleEdge
+	edges = append(edges, left.CycleEdges...)
+	edges = append(edges, right.CycleEdges...)
+	edges = append(edges, CycleEdge{"b", "c"}, CycleEdge{"d", "a"})
+	old := v([]string{"a", "b", "c", "d"}, edges...)
+	encode := func(violations ...Violation) *BaselineFile {
+		t.Helper()
+		raw, err := EncodeBaseline(violations)
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseline, err := ParseBaseline(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return baseline
+	}
+	recorded := encode(old)
+	split := encode(left, right)
+	if n := BaselineExpansion(recorded, split); n != 0 {
+		t.Fatalf("split added %d occurrences", n)
+	}
+	report := &Report{Violations: []Violation{left, right}}
+	EvaluateBoundariesWithBaseline(report, recorded)
+	if len(report.Violations) != 0 || report.GrandfatheredCount != 2 {
+		t.Fatalf("split not grandfathered: %+v", report)
+	}
+	if n := BaselineExpansion(split, recorded); n != 1 {
+		t.Fatalf("joined distinct allowances: %d", n)
+	}
+	if n := BaselineExpansion(recorded, encode(left, left)); n == 0 {
+		t.Fatal("duplicate allowance grew")
+	}
+	newEdge := v([]string{"a", "b"}, CycleEdge{"a", "b"}, CycleEdge{"b", "a"}, CycleEdge{"a", "a"})
+	if n := BaselineExpansion(recorded, encode(newEdge)); n != 1 {
+		t.Fatalf("new internal edge accepted: %d", n)
+	}
+}
+
+func TestGoPackageAllowanceSurvivesWitnessChange(t *testing.T) {
+	v := Violation{Kind: "denied-dependency", RuleID: "no-lib", From: "app", To: "lib", File: "app/main.go", TargetFile: "lib/zzz.go"}
+	legacy, err := EncodeBaseline([]Violation{v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := ParseBaseline(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.TargetPackageDir = "lib"
+	before := ViolationFingerprint(v)
+	v.TargetFile = "lib/aaa.go"
+	if before != ViolationFingerprint(v) {
+		t.Fatal("Go witness changed package fingerprint")
+	}
+	report := Report{Violations: []Violation{v, v}}
+	EvaluateBoundariesWithBaseline(&report, old)
+	if report.GrandfatheredCount != 1 || len(report.Violations) != 1 {
+		t.Fatalf("allowance reused or lost: %+v", report)
+	}
+	raw, err := EncodeBaseline([]Violation{v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := ParseBaseline(raw)
+	if err != nil || canonical.Entries[0].Target != "lib" || BaselineExpansion(old, canonical) != 0 {
+		t.Fatalf("package baseline not compatible with legacy allowance: %s %v", raw, err)
 	}
 }

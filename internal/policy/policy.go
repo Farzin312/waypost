@@ -6,486 +6,107 @@ import (
 	"io/fs"
 	"reflect"
 	"slices"
-	"sort"
 
 	"github.com/Farzin312/waypost/internal/archgraph"
-	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
-	"github.com/Farzin312/waypost/internal/gitdiff"
-	"github.com/Farzin312/waypost/internal/lockfile"
+	"github.com/Farzin312/waypost/internal/project"
 )
 
-// SelectedCheck binds a check to whether it will run and why.
-type SelectedCheck struct {
-	Check    config.Check `json:"check"`
-	Selected bool         `json:"selected"`
-	Reason   string       `json:"reason"`
-	FromBase bool         `json:"from_base,omitempty"`
-}
-
-// BaseFloor holds the trusted base-branch policy resolved strictly from git.
-type BaseFloor struct {
-	Enforced                bool
-	Loaded                  bool
-	BaseConfig              *config.ResolvedConfig
-	RequireFrozenLockInCI   bool
-	FailClosedOnUnmapped    bool
-	AllowedProviderCommands map[string]string
-	BoundaryBaseline        *archgraph.BaselineFile
-	LoadError               string
-}
-
-// LoadBaseFloor resolves the trusted target base branch's .waypost.yaml and all of
-// its file-based `extends` ancestors strictly from `git show <TargetSHA>:<path>`
-// (never touching the PR worktree). In CI mode, this runs BEFORE planning, provider
-// execution, or check execution so a PR cannot disable its own CI policy floor.
-func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *gitdiff.Snapshot, offline bool) BaseFloor {
-	bf := BaseFloor{
-		RequireFrozenLockInCI: config.BoolVal(headRes.Effective.Policy.RequireFrozenLockInCI, true),
-		FailClosedOnUnmapped:  config.BoolVal(headRes.Effective.Policy.FailClosedOnUnmapped, true),
+// CompareFloor detects weakening against an independently resolved target snapshot.
+func CompareFloor(target, head, lineage *project.Snapshot) (findings, blocking []string, baseline *archgraph.BaselineFile) {
+	base, next := target.Config(), head.Config()
+	fork := lineage.Config()
+	if fork == nil {
+		fork = base
 	}
-	if mode != "ci" || snap == nil || !snap.IsGitRepo {
-		return bf
+	forkChecks := make(map[string]config.Check)
+	for _, check := range fork.Checks {
+		forkChecks[check.ID] = check
 	}
-	ref := snap.TargetSHA
-	if ref == "" {
-		ref = snap.BaseSHA
-	}
-	if ref == "" {
-		return bf
-	}
-
-	reader := func(relPath string) ([]byte, bool, error) {
-		return gitdiff.ReadFileAtRef(repoDir, ref, relPath)
-	}
-	baseRaw, exists, err := reader(config.ConfigFileName)
-	if err != nil {
-		bf.LoadError = fmt.Sprintf("unable to read base policy floor at %s: %v", ref, err)
-		return bf
-	}
-	if !exists {
-		return bf
-	}
-
-	var basePinned map[string]string
-	if lockRaw, lockExists, lockErr := reader(lockfile.LockFileName); lockErr == nil && lockExists {
-		if baseLF, _, parseErr := lockfile.ParseBytes(lockRaw); parseErr == nil {
-			basePinned = lockfile.PinnedRemoteSHAs(baseLF)
+	block := func(message string) { findings = append(findings, message); blocking = append(blocking, message) }
+	for _, flag := range []struct {
+		name     string
+		old, new *bool
+	}{
+		{"enforce_base_floor_in_ci", base.Policy.EnforceBaseFloorInCI, next.Policy.EnforceBaseFloorInCI},
+		{"require_frozen_lock_in_ci", base.Policy.RequireFrozenLockInCI, next.Policy.RequireFrozenLockInCI},
+		{"fail_closed_on_unmapped", base.Policy.FailClosedOnUnmapped, next.Policy.FailClosedOnUnmapped},
+	} {
+		if config.BoolVal(flag.old, true) && !config.BoolVal(flag.new, true) {
+			block(fmt.Sprintf("PR attempted to set %s=false; trusted policy floor remains enforced", flag.name))
 		}
 	}
-
-	baseRes, loadErr := config.Load(repoDir, config.LoadOptions{
-		Mode:                "ci",
-		OverrideRootRaw:     baseRaw,
-		OverrideLabel:       ref + ":" + config.ConfigFileName,
-		RepoFileReader:      reader,
-		PinnedRemoteSHAs:    basePinned,
-		RequirePinnedRemote: true,
-		Offline:             offline,
-	})
-	if loadErr != nil {
-		bf.LoadError = fmt.Sprintf("base policy floor at %s failed to resolve: %v", ref, loadErr)
-		return bf
+	headChecks := make(map[string]config.Check)
+	for _, c := range next.Checks {
+		headChecks[c.ID] = c
 	}
-
-	bf.Loaded = true
-	bf.BaseConfig = baseRes
-	bf.Enforced = config.BoolVal(baseRes.Effective.Policy.EnforceBaseFloorInCI, true)
-	if bf.Enforced {
-		// Base policy controls take precedence over PR attempts to weaken CI enforcement.
-		if config.BoolVal(baseRes.Effective.Policy.RequireFrozenLockInCI, true) {
-			bf.RequireFrozenLockInCI = true
-		}
-		if config.BoolVal(baseRes.Effective.Policy.FailClosedOnUnmapped, true) {
-			bf.FailClosedOnUnmapped = true
-		}
-		if b := baseRes.Effective.Boundaries; b.IsEnabled() && b.EffectiveMode() == "ratchet" {
-			baseline, err := ReadBaselineAtRef(repoDir, ref, b.BaselinePath())
-			if err != nil {
-				bf.LoadError = fmt.Sprintf("trusted base boundary baseline %q at %s: %v", b.BaselinePath(), ref, err)
-			}
-			bf.BoundaryBaseline = baseline
-		}
-		bf.AllowedProviderCommands = make(map[string]string)
-		for _, p := range baseRes.Effective.Providers {
-			if p.Authorized {
-				bf.AllowedProviderCommands[p.ID] = p.Command
-			}
-		}
-	}
-	return bf
-}
-
-// ReadBaselineAtRef reads a committed, regular baseline from a trusted Git tree.
-func ReadBaselineAtRef(repoDir, ref, rel string) (*archgraph.BaselineFile, error) {
-	raw, found, err := gitdiff.ReadBoundedRegularFileAtRef(repoDir, ref, rel, archgraph.MaxBaselineBytes)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, fs.ErrNotExist
-	}
-	return archgraph.ParseBaseline(raw)
-}
-
-func baselineTampering(repoDir, headRef string, paths []string, base *archgraph.BaselineFile) []string {
-	trusted := make(map[string]int, len(base.Entries))
-	for _, entry := range base.Entries {
-		trusted[entry.Fingerprint] = entry.Occurrences()
-	}
-	var findings []string
-	for _, rel := range paths {
-		head, err := ReadBaselineAtRef(repoDir, headRef, rel)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // Graduation can remove the baseline. Ratchet still requires it during verification.
-		}
-		if err != nil {
-			findings = append(findings, fmt.Sprintf("PR boundary baseline %q is invalid: %v", rel, err))
+	for _, c := range base.Checks {
+		if !c.IsRequired() {
 			continue
 		}
-		added := 0
-		for _, entry := range head.Entries {
-			added += max(0, entry.Occurrences()-trusted[entry.Fingerprint])
-		}
-		if added > 0 {
-			findings = append(findings, fmt.Sprintf("PR expanded boundary baseline %q by %d violation occurrence(s) beyond the trusted base allowance", rel, added))
-		}
-	}
-	return findings
-}
-
-var boundaryModeStrictness = map[string]int{"enforce": 3, "ratchet": 2, "warn": 1}
-
-// PlanResult captures policy authority decisions, trust-boundary escalations,
-// base-branch policy floor enforcement, and the final check execution plan.
-type PlanResult struct {
-	TrustBoundaryTriggered bool                     `json:"trust_boundary_triggered"`
-	PolicyFloorEnforced    bool                     `json:"policy_floor_enforced"`
-	FullRepoEscalated      bool                     `json:"full_repo_escalated"`
-	EscalationReasons      []string                 `json:"escalation_reasons,omitempty"`
-	TamperingFindings      []string                 `json:"tampering_findings,omitempty"`
-	Impact                 compmap.Impact           `json:"impact"`
-	Checks                 []SelectedCheck          `json:"checks"`
-	EffectivePolicyDigest  string                   `json:"effective_policy_digest"`
-	BoundaryTampering      []string                 `json:"-"`
-	EffectiveBoundaries    *config.BoundariesConfig `json:"-"`
-}
-
-// Plan determines which checks must run under the active policy, trusted BaseFloor, and mode.
-func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, cm *compmap.Map, snap *gitdiff.Snapshot, runAll bool) (*PlanResult, error) {
-	cfg := resolved.Effective
-	effectiveBoundaries := cfg.Boundaries
-	res := &PlanResult{
-		EffectivePolicyDigest: resolved.PolicyDigest,
-		EffectiveBoundaries:   effectiveBoundaries,
-	}
-
-	trustPaths := append([]string{
-		config.ConfigFileName,
-		".waypost.lock",
-		".github/workflows/**",
-		".bounds/**",
-	}, cfg.Policy.TrustPaths...)
-	var baselinePaths []string
-	if cfg.Boundaries.EffectiveMode() == "ratchet" {
-		baselinePaths = append(baselinePaths, cfg.Boundaries.BaselinePath())
-	}
-	for _, c := range cm.Components {
-		trustPaths = append(trustPaths, c.TrustPaths...)
-	}
-
-	effectiveChecks := append([]config.Check(nil), cfg.Checks...)
-	effectiveByID := make(map[string]config.Check, len(effectiveChecks))
-	for _, c := range effectiveChecks {
-		effectiveByID[c.ID] = c
-	}
-
-	baseEnforcedIDs := make(map[string]bool)
-
-	if bf.LoadError != "" {
-		res.FullRepoEscalated = true
-		res.EscalationReasons = append(res.EscalationReasons, bf.LoadError)
-	}
-
-	// Enforce trusted base-branch policy floor in CI mode.
-	if mode == "ci" && bf.Loaded && bf.Enforced && bf.BaseConfig != nil {
-		res.PolicyFloorEnforced = true
-		baseEff := bf.BaseConfig.Effective
-
-		// Retain both global AND component trust paths from the trusted base policy.
-		trustPaths = append(trustPaths, baseEff.Policy.TrustPaths...)
-		for _, bc := range baseEff.Components {
-			trustPaths = append(trustPaths, bc.TrustPaths...)
-		}
-
-		// Detect PR weakening of CI policy flags.
-		if !config.BoolVal(cfg.Policy.EnforceBaseFloorInCI, true) {
-			res.TamperingFindings = append(res.TamperingFindings,
-				"PR attempted to set enforce_base_floor_in_ci=false; base policy floor remains enforced")
-		}
-		if config.BoolVal(baseEff.Policy.RequireFrozenLockInCI, true) && !config.BoolVal(cfg.Policy.RequireFrozenLockInCI, true) {
-			res.TamperingFindings = append(res.TamperingFindings,
-				"PR attempted to set require_frozen_lock_in_ci=false; base policy floor requires frozen lock")
-		}
-		if config.BoolVal(baseEff.Policy.FailClosedOnUnmapped, true) && !config.BoolVal(cfg.Policy.FailClosedOnUnmapped, true) {
-			res.TamperingFindings = append(res.TamperingFindings,
-				"PR attempted to set fail_closed_on_unmapped=false; base policy floor enforces fail-closed unmapped escalation")
-		}
-
-		// Compare complete check definitions for every required base check.
-		// If removed, downgraded, or altered in command/workdir/requires_bin/timeout/scope,
-		// restore the trusted base check definition so the PR cannot substitute or weaken it.
-		for _, baseChk := range baseEff.Checks {
-			if !baseChk.IsRequired() {
-				continue
-			}
-			headChk, ok := effectiveByID[baseChk.ID]
-			if !ok {
-				res.TamperingFindings = append(res.TamperingFindings,
-					fmt.Sprintf("required base check %q was removed or disabled in PR; enforced from base policy floor", baseChk.ID))
-				effectiveChecks = append(effectiveChecks, baseChk)
-				effectiveByID[baseChk.ID] = baseChk
-				baseEnforcedIDs[baseChk.ID] = true
-				continue
-			}
-			if !checksEquivalent(baseChk, headChk) {
-				res.TamperingFindings = append(res.TamperingFindings,
-					fmt.Sprintf("required base check %q was modified or weakened in PR; trusted base definition enforced", baseChk.ID))
-				replaceCheck(effectiveChecks, baseChk)
-				effectiveByID[baseChk.ID] = baseChk
-				baseEnforcedIDs[baseChk.ID] = true
-			}
-		}
-
-		// Enforce trusted base architecture boundary policy floor so PRs cannot weaken or delete boundary rules.
-		if baseEff.Boundaries.IsEnabled() {
-			if effectiveBoundaries == nil {
-				effectiveBoundaries = &config.BoundariesConfig{}
-			} else {
-				copy := *effectiveBoundaries
-				copy.Rules = slices.Clone(copy.Rules)
-				effectiveBoundaries = &copy
-			}
-			for _, exclusion := range effectiveBoundaries.IgnorePaths {
-				if !slices.Contains(baseEff.Boundaries.IgnorePaths, exclusion) {
-					res.TamperingFindings = append(res.TamperingFindings,
-						fmt.Sprintf("PR added boundaries.ignore_paths exclusion %q; trusted base exclusions enforced", exclusion))
-				}
-			}
-			effectiveBoundaries.IgnorePaths = baseEff.Boundaries.IgnorePaths
-
-			if !effectiveBoundaries.IsEnabled() {
-				res.TamperingFindings = append(res.TamperingFindings,
-					"PR disabled built-in architecture boundaries; base boundary policy remains enforced")
-				effectiveBoundaries.Enabled = config.BoolPtr(true)
-			}
-			baseMode, headMode := baseEff.Boundaries.EffectiveMode(), effectiveBoundaries.EffectiveMode()
-			if boundaryModeStrictness[baseMode] > boundaryModeStrictness[headMode] {
-				res.BoundaryTampering = append(res.BoundaryTampering,
-					fmt.Sprintf("PR downgraded boundaries.mode from %s to %s; %s mode remains active", baseMode, headMode, baseMode))
-				effectiveBoundaries.Mode = baseMode
-			}
-			if baseMode == "ratchet" {
-				basePath := baseEff.Boundaries.BaselinePath()
-				if !slices.Contains(baselinePaths, basePath) {
-					baselinePaths = append(baselinePaths, basePath)
-				}
-				if bf.BoundaryBaseline != nil && snap != nil && snap.HeadSHA != "" {
-					res.BoundaryTampering = append(res.BoundaryTampering, baselineTampering(repoDir, snap.HeadSHA, baselinePaths, bf.BoundaryBaseline)...)
-				}
-			}
-			if config.BoolVal(baseEff.Boundaries.NoCycles, true) && !config.BoolVal(effectiveBoundaries.NoCycles, true) {
-				res.TamperingFindings = append(res.TamperingFindings,
-					"PR disabled boundaries.no_cycles; cycle enforcement remains active")
-				effectiveBoundaries.NoCycles = config.BoolPtr(true)
-			}
-			if config.BoolVal(baseEff.Boundaries.EnforceDeclaredDeps, false) && !config.BoolVal(effectiveBoundaries.EnforceDeclaredDeps, false) {
-				res.TamperingFindings = append(res.TamperingFindings,
-					"PR disabled boundaries.enforce_declared_deps; declared dependency boundary enforcement remains active")
-				effectiveBoundaries.EnforceDeclaredDeps = config.BoolPtr(true)
-			}
-			headRuleIdx := make(map[string]int, len(effectiveBoundaries.Rules))
-			for i, r := range effectiveBoundaries.Rules {
-				headRuleIdx[r.ID] = i
-			}
-			var changedHeadRules []config.BoundaryRule
-			for _, baseRule := range baseEff.Boundaries.Rules {
-				if idx, ok := headRuleIdx[baseRule.ID]; !ok {
-					res.TamperingFindings = append(res.TamperingFindings,
-						fmt.Sprintf("boundary rule %q was removed in PR; enforced from base policy floor", baseRule.ID))
-					effectiveBoundaries.Rules = append(effectiveBoundaries.Rules, baseRule)
-				} else if !reflect.DeepEqual(baseRule, effectiveBoundaries.Rules[idx]) {
-					res.TamperingFindings = append(res.TamperingFindings,
-						fmt.Sprintf("boundary rule %q was modified in PR; trusted base rule enforced", baseRule.ID))
-					changedHeadRules = append(changedHeadRules, effectiveBoundaries.Rules[idx])
-					effectiveBoundaries.Rules[idx] = baseRule
-				}
-			}
-			// A replacement can add constraints. Evaluate it alongside the restored
-			// floor rule so a stricter PR rule still applies to the PR's components.
-			effectiveBoundaries.Rules = append(effectiveBoundaries.Rules, changedHeadRules...)
-		}
-
-		res.TamperingFindings = append(res.TamperingFindings, res.BoundaryTampering...)
-		if len(res.TamperingFindings) > 0 {
-			res.TrustBoundaryTriggered = true
-			res.FullRepoEscalated = true
-			res.EscalationReasons = append(res.EscalationReasons, "base-branch policy floor detected policy or check tampering")
-		}
-	}
-
-	res.EffectiveBoundaries = effectiveBoundaries
-
-	// Recompute effective policy digest over the actually enforced check & boundary set.
-	enforcedCfg := cfg
-	enforcedCfg.Checks = effectiveChecks
-	enforcedCfg.Policy.TrustPaths = trustPaths
-	enforcedCfg.Boundaries = effectiveBoundaries
-	if d, err := config.ComputeDigest(enforcedCfg); err == nil {
-		res.EffectivePolicyDigest = d
-	}
-
-	if snap != nil && snap.MergeBaseError != "" {
-		res.FullRepoEscalated = true
-		res.EscalationReasons = append(res.EscalationReasons, "merge-base unavailable: "+snap.MergeBaseError)
-	}
-
-	var changed []string
-	if snap != nil {
-		changed = snap.AffectedPaths
-	}
-	res.Impact = cm.ImpactedByPaths(changed)
-
-	// Check trust-boundary paths against ALL affected paths (both sides of renames + deletions).
-	var trustHits []string
-	for _, p := range changed {
-		if slices.Contains(baselinePaths, p) || compmap.MatchAnyGlob(trustPaths, p) {
-			trustHits = append(trustHits, p)
-		}
-	}
-	if len(trustHits) > 0 {
-		res.TrustBoundaryTriggered = true
-		res.FullRepoEscalated = true
-		res.EscalationReasons = append(res.EscalationReasons, fmt.Sprintf("trust-boundary paths modified: %v", trustHits))
-	}
-
-	// Fail closed on unmapped changed paths using trusted policy flag.
-	if len(res.Impact.UnmappedPaths) > 0 && bf.FailClosedOnUnmapped {
-		res.FullRepoEscalated = true
-		res.EscalationReasons = append(res.EscalationReasons,
-			fmt.Sprintf("unmapped changed paths escalated to full repo gate: %v", res.Impact.UnmappedPaths))
-	}
-
-	if runAll {
-		res.FullRepoEscalated = true
-		res.EscalationReasons = append(res.EscalationReasons, "--all flag requested full repository verification")
-	}
-
-	impactedComps := make(map[string]bool)
-	for _, id := range res.Impact.DirectComponents {
-		impactedComps[id] = true
-	}
-	for _, id := range res.Impact.TransitiveDependents {
-		impactedComps[id] = true
-	}
-
-	compBoundChecks := make(map[string]bool)
-	for _, c := range cm.Components {
-		if impactedComps[c.ID] {
-			for _, cid := range c.Checks {
-				compBoundChecks[cid] = true
-			}
-		}
-	}
-
-	pinChecks := make(map[string]bool)
-	triggeredPinSet := make(map[string]bool, len(res.Impact.TriggeredPins))
-	for _, id := range res.Impact.TriggeredPins {
-		triggeredPinSet[id] = true
-	}
-	for _, pin := range cm.Pins {
-		if triggeredPinSet[pin.ID] && pin.CompatibilityCheck != "" {
-			pinChecks[pin.CompatibilityCheck] = true
-		}
-	}
-
-	for _, chk := range effectiveChecks {
-		sc := SelectedCheck{
-			Check:    chk,
-			FromBase: baseEnforcedIDs[chk.ID],
-		}
+		candidate, ok := headChecks[c.ID]
+		prior, existed := forkChecks[c.ID]
 		switch {
-		case res.FullRepoEscalated:
-			sc.Selected = true
-			sc.Reason = "full repo verification escalated"
-		case len(changed) == 0 && (snap == nil || !snap.IsGitRepo || snap.BaseSHA == ""):
-			sc.Selected = true
-			sc.Reason = "no git diff base available; running full check set"
-		case pinChecks[chk.ID]:
-			sc.Selected = true
-			sc.Reason = "triggered by cross-repo pin compatibility requirement"
-		case compBoundChecks[chk.ID]:
-			sc.Selected = true
-			sc.Reason = "bound to directly or transitively impacted component"
-		case checkMatchesComponents(chk, impactedComps):
-			sc.Selected = true
-			sc.Reason = "check targets impacted component"
-		case len(chk.Paths) == 0:
-			if len(changed) > 0 {
-				sc.Selected = true
-				sc.Reason = "global repository check"
-			} else {
-				sc.Selected = false
-				sc.Reason = "no changed paths"
+		case !ok && !existed:
+			// The target introduced a check after the branches diverged.
+			// There is no head removal, but the target command must still run.
+		case ok && !candidate.IsRequired() && existed && !prior.IsRequired():
+		case !ok:
+			block(fmt.Sprintf("required base check %q was removed or disabled", c.ID))
+		case !candidate.IsRequired():
+			block(fmt.Sprintf("required base check %q was made optional", c.ID))
+		case !reflect.DeepEqual(c, candidate):
+			findings = append(findings, fmt.Sprintf("required base check %q was modified; both obligations retained", c.ID))
+		}
+	}
+	old, new := base.Boundaries, next.Boundaries
+	strict := map[string]int{"warn": 1, "ratchet": 2, "enforce": 3}
+	if old.IsEnabled() {
+		if !new.IsEnabled() {
+			block("PR disabled built-in architecture boundaries")
+		}
+		if strict[old.EffectiveMode()] > strict[new.EffectiveMode()] {
+			block(fmt.Sprintf("PR downgraded boundaries.mode from %s to %s", old.EffectiveMode(), new.EffectiveMode()))
+		}
+		if new != nil {
+			for _, p := range new.IgnorePaths {
+				if !slices.Contains(old.IgnorePaths, p) {
+					findings = append(findings, fmt.Sprintf("PR added boundaries.ignore_paths exclusion %q; trusted exclusions remain enforced", p))
+				}
 			}
-		case anyPathMatches(chk.Paths, changed):
-			sc.Selected = true
-			sc.Reason = "changed path matched check glob"
-		default:
-			sc.Selected = false
-			sc.Reason = "no changed paths or impacted components matched"
+			if config.BoolVal(old.NoCycles, true) && !config.BoolVal(new.NoCycles, true) {
+				block("PR disabled boundaries.no_cycles")
+			}
+			if config.BoolVal(old.EnforceDeclaredDeps, false) && !config.BoolVal(new.EnforceDeclaredDeps, false) {
+				block("PR disabled boundaries.enforce_declared_deps")
+			}
 		}
-		res.Checks = append(res.Checks, sc)
-	}
-
-	sort.Strings(res.EscalationReasons)
-	sort.Strings(res.TamperingFindings)
-	return res, nil
-}
-
-func checksEquivalent(a, b config.Check) bool {
-	return a.Command == b.Command &&
-		a.Workdir == b.Workdir &&
-		a.IsRequired() == b.IsRequired() &&
-		a.TimeoutSeconds == b.TimeoutSeconds &&
-		a.RequiresBin == b.RequiresBin &&
-		reflect.DeepEqual(a.Paths, b.Paths) &&
-		reflect.DeepEqual(a.Components, b.Components)
-}
-
-func checkMatchesComponents(chk config.Check, impacted map[string]bool) bool {
-	for _, cid := range chk.Components {
-		if impacted[cid] {
-			return true
-		}
-	}
-	return false
-}
-
-func anyPathMatches(globs, paths []string) bool {
-	for _, p := range paths {
-		if compmap.MatchAnyGlob(globs, p) {
-			return true
+		if old.EffectiveMode() == "ratchet" {
+			var err error
+			baseline, err = target.RecordedBaseline()
+			if err != nil {
+				block(fmt.Sprintf("trusted base boundary baseline: %v", err))
+			}
+			if baseline != nil {
+				paths := []string{old.BaselinePath()}
+				if new != nil && new.EffectiveMode() == "ratchet" && !slices.Contains(paths, new.BaselinePath()) {
+					paths = append(paths, new.BaselinePath())
+				}
+				for _, p := range paths {
+					current, err := head.Baseline(p)
+					if errors.Is(err, fs.ErrNotExist) {
+						continue
+					}
+					if err != nil {
+						block(fmt.Sprintf("PR boundary baseline %q is invalid: %v", p, err))
+						continue
+					}
+					if n := archgraph.BaselineExpansion(baseline, current); n > 0 {
+						block(fmt.Sprintf("PR expanded boundary baseline %q by %d violation occurrence(s)", p, n))
+					}
+				}
+			}
 		}
 	}
-	return false
-}
-
-func replaceCheck(checks []config.Check, updated config.Check) {
-	for i := range checks {
-		if checks[i].ID == updated.ID {
-			checks[i] = updated
-			return
-		}
-	}
+	return findings, blocking, baseline
 }

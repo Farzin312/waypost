@@ -31,6 +31,9 @@ func MigrateFromBounds(repoDir string) (*BoundsMigration, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load .bounds: %w", err)
 	}
+	for _, diagnostic := range project.Errors {
+		project.Warnings = append(project.Warnings, diagnostic.Error())
+	}
 	if len(project.Subsystems) == 0 {
 		return nil, fmt.Errorf("no valid subsystem manifests found under %s/.bounds/manifests: %s", absRepo, strings.Join(project.Warnings, "; "))
 	}
@@ -119,10 +122,10 @@ func migratedEntrypoints(repo string, subsystem compmap.BoundsSubsystem) ([]stri
 		if file == "" {
 			file = expose.File
 		}
-		if file == "" && isSupportedSource(expose.Name) {
+		if file == "" && IsSupportedSource(expose.Name) {
 			file = expose.Name
 		}
-		if file == "" || (expose.Name != "" && !isSupportedSource(expose.Name)) {
+		if file == "" || (expose.Name != "" && !IsSupportedSource(expose.Name)) {
 			hasSymbols = true
 		}
 		if file == "" {

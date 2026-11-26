@@ -2,19 +2,24 @@ package compmap
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Farzin312/waypost/internal/config"
+	"github.com/Farzin312/waypost/internal/repoview"
 	"github.com/Farzin312/waypost/internal/shellcmd"
 )
 
@@ -27,8 +32,11 @@ const (
 
 // BuildOptions controls optional external provider execution during component map construction.
 type BuildOptions struct {
+	Context                 context.Context
+	SkipInventoryOwnership  bool
 	AllowProviders          bool
 	AllowedProviderCommands map[string]string
+	View                    *repoview.View
 	AllowedFiles            map[string]bool // nil permits all static discovery inputs
 }
 
@@ -59,13 +67,25 @@ type ProviderStatus struct {
 }
 
 // Map is the complete component map and ecosystem inventory for a repository.
+// DiscoveryError describes a present manifest that could not be read or parsed.
+type DiscoveryError struct {
+	Path string
+	Err  error
+}
+
+func (e DiscoveryError) Error() string { return fmt.Sprintf("manifest %s: %v", e.Path, e.Err) }
+
 type Map struct {
+	DiscoveryErrors  []DiscoveryError      `json:"-"`
+	PinInputs        map[string][]string   `json:"-"`
 	Components       []Component           `json:"components"`
 	Pins             []config.CrossRepoPin `json:"pins,omitempty"`
 	Ecosystem        EcosystemInfo         `json:"ecosystem"`
 	UnmappedPaths    []string              `json:"unmapped_paths,omitempty"`
 	CoverageGaps     []string              `json:"coverage_gaps,omitempty"`
-	ProviderStatuses []ProviderStatus      `json:"provider_statuses,omitempty"`
+	ownerCache       *sync.Map
+	ownerPaths       [][]Glob
+	ProviderStatuses []ProviderStatus `json:"provider_statuses,omitempty"`
 }
 
 // Impact summarizes what components, reverse dependents, and cross-repo pins are
@@ -113,23 +133,53 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 
 	byID := make(map[string]Component)
 	byRoot := make(map[string]string)
-	inferred, gaps, err := inferManifests(absRepo, opts.AllowedFiles)
+	read := func(rel string, max int) ([]byte, error) {
+		return ReadBoundedRegularFile(absRepo, filepath.Join(absRepo, rel), max)
+	}
+	if opts.View != nil {
+		opts.AllowedFiles = opts.View.Inventory()
+		read = opts.View.Read
+	}
+	var discoveryErrors []DiscoveryError
+	inferred, gaps, err := inferManifests(absRepo, opts.AllowedFiles, opts.View, read, &discoveryErrors)
 	if err != nil {
 		return nil, err
 	}
-	eco := inspectEcosystem(absRepo)
+	var eco EcosystemInfo
+	if opts.View != nil {
+		eco = inspectViewEcosystem(opts.View)
+	} else {
+		eco = inspectEcosystem(absRepo)
+	}
 	for _, c := range inferred {
 		byID[c.ID] = c
 		byRoot[normalizeRoot(c.Root)] = c.ID
 	}
 
 	// Merge static legacy subsystem declarations.
-	if project, err := LoadBoundsProject(absRepo, opts.AllowedFiles); err == nil {
+	if project, err := loadBoundsProject(absRepo, opts.AllowedFiles, func(_, full string, limit int) ([]byte, error) {
+		rel, err := filepath.Rel(absRepo, full)
+		if err != nil {
+			return nil, err
+		}
+		return read(filepath.ToSlash(rel), limit)
+	}); err == nil {
+		gaps = append(gaps, project.Warnings...)
+		discoveryErrors = append(discoveryErrors, project.Errors...)
 		for _, subsystem := range project.Subsystems {
 			c := subsystem.Component
 			byID[c.ID] = c
 			byRoot[normalizeRoot(c.Root)] = c.ID
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		var diagnostic DiscoveryError
+		if !errors.As(err, &diagnostic) {
+			diagnostic = DiscoveryError{".bounds/root.yaml", err}
+		}
+		discoveryErrors = append(discoveryErrors, diagnostic)
+	}
+	for _, diagnostic := range discoveryErrors {
+		gaps = append(gaps, diagnostic.Error())
 	}
 
 	// Overlay declared components (declared metadata wins over inferred/tool-observed).
@@ -169,6 +219,9 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 				}
 				if comp.Language == "" {
 					comp.Language = prev.Language
+				}
+				if len(comp.Entrypoints) == 0 {
+					comp.Entrypoints = prev.Entrypoints
 				}
 				if dc.DependsOn == nil {
 					comp.DependsOn = prev.DependsOn
@@ -213,9 +266,15 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 
 	m := &Map{
 		Components:       comps,
+		DiscoveryErrors:  discoveryErrors,
+		ownerCache:       new(sync.Map),
+		ownerPaths:       make([][]Glob, len(comps)),
 		Ecosystem:        eco,
 		CoverageGaps:     uniqueSorted(gaps),
 		ProviderStatuses: provStatuses,
+	}
+	for i, c := range comps {
+		m.ownerPaths[i] = CompileGlobs(c.Paths)
 	}
 	if cfg != nil {
 		m.Pins = append([]config.CrossRepoPin(nil), cfg.Pins...)
@@ -240,32 +299,66 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 // OwnersOf returns component IDs whose declared/inferred paths match relPath.
 func (m *Map) OwnersOf(relPath string) []string {
 	relPath = strings.TrimPrefix(filepath.ToSlash(relPath), "./")
-	var exactMatches []Component
-	var declaredRootCatchAll []Component
-	var inferredRootCatchAll []Component
-	for _, c := range m.Components {
-		if MatchAnyGlob(c.Paths, relPath) {
-			if c.Root == "." && len(c.Paths) == 1 && c.Paths[0] == "**" {
-				if c.Provenance == ProvenanceDeclared {
-					declaredRootCatchAll = append(declaredRootCatchAll, c)
-				} else {
-					inferredRootCatchAll = append(inferredRootCatchAll, c)
-				}
-			} else {
-				exactMatches = append(exactMatches, c)
-			}
+	owners, _ := m.pathOwners(relPath)
+	return slices.Clone(owners)
+}
+
+// PrimaryOwner is the single most specific owner used for architecture edges.
+func (m *Map) PrimaryOwner(relPath string) string {
+	_, primary := m.pathOwners(relPath)
+	return primary
+}
+
+type ownership struct {
+	all     []string
+	primary string
+}
+
+func (m *Map) pathOwners(relPath string) ([]string, string) {
+	if m.ownerCache != nil {
+		if v, ok := m.ownerCache.Load(relPath); ok {
+			o := v.(ownership)
+			return o.all, o.primary
 		}
 	}
-	chosen := append(declaredRootCatchAll, exactMatches...)
-	if len(chosen) == 0 {
-		chosen = inferredRootCatchAll
+	var primary string
+	best := -1
+	var owners, fallback []string
+	for i, c := range m.Components {
+		var matches bool
+		if m.ownerPaths != nil {
+			matches = MatchCompiled(m.ownerPaths[i], relPath)
+		} else {
+			matches = MatchAnyGlob(c.Paths, relPath)
+		}
+		if !matches {
+			continue
+		}
+		catchAll := c.Root == "." && len(c.Paths) == 1 && c.Paths[0] == "**"
+		score := len(c.Root) * 10
+		if catchAll {
+			score = 0
+		}
+		if c.Provenance == ProvenanceDeclared {
+			score += 2
+		}
+		if score > best || (score == best && c.ID < primary) {
+			primary, best = c.ID, score
+		}
+		if catchAll && c.Provenance != ProvenanceDeclared {
+			fallback = append(fallback, c.ID)
+		} else {
+			owners = append(owners, c.ID)
+		}
 	}
-	ids := make([]string, 0, len(chosen))
-	for _, c := range chosen {
-		ids = append(ids, c.ID)
+	if len(owners) == 0 {
+		owners = fallback
 	}
-	sort.Strings(ids)
-	return ids
+	sort.Strings(owners)
+	if m.ownerCache != nil {
+		m.ownerCache.Store(relPath, ownership{owners, primary})
+	}
+	return owners, primary
 }
 
 // ImpactedByPaths computes direct component hits, transitive reverse dependents
@@ -307,12 +400,16 @@ func (m *Map) ImpactedByPaths(changedPaths []string) Impact {
 
 	pinSet := make(map[string]bool)
 	for _, pin := range m.Pins {
-		if directSet[pin.Consumer] || depSet[pin.Consumer] {
+		consumer := pin.ConsumerComponent
+		if consumer == "" {
+			consumer = pin.Consumer
+		}
+		if directSet[consumer] || depSet[consumer] {
 			pinSet[pin.ID] = true
 			continue
 		}
 		for _, p := range changedPaths {
-			if MatchAnyGlob(pin.Paths, p) {
+			if m.PinTouched(pin, p) {
 				pinSet[pin.ID] = true
 				break
 			}
@@ -367,97 +464,109 @@ func StaticComponentInput(rel string) bool {
 	return strings.HasSuffix(name, ".uproject")
 }
 
-func inferManifests(absRepo string, allowedFiles map[string]bool) ([]Component, []string, error) {
+// PinTouched checks declared and discovered artifact inputs for a pin.
+func (m *Map) PinTouched(pin config.CrossRepoPin, path string) bool {
+	return slices.Contains(m.PinInputs[pin.ID], path) || PinTouches(pin, path)
+}
+
+// PinTouches reports direct artifact/source edits, separately from consumer impact.
+func PinTouches(pin config.CrossRepoPin, rel string) bool {
+	return (pin.Source != nil && (pin.Source.Manifest == rel ||
+		filepath.ToSlash(filepath.Join(filepath.Dir(pin.Source.Manifest), "package-lock.json")) == rel)) ||
+		pin.Artifact == rel || MatchAnyGlob(pin.Paths, rel)
+}
+
+func inferManifests(absRepo string, allowedFiles map[string]bool, view *repoview.View, read func(string, int) ([]byte, error), discoveryErrors *[]DiscoveryError) ([]Component, []string, error) {
 	var items []inferredItem
 	var gaps []string
 	rootsWithManifest := make(map[string]bool)
-
-	err := filepath.WalkDir(absRepo, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
+	var paths []string
+	if allowedFiles != nil {
+		paths = mapKeysSorted(allowedFiles)
+	} else {
+		err := filepath.WalkDir(absRepo, func(full string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(absRepo, full)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if d.IsDir() {
+				if rel != "." && (skipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".") || strings.Count(rel, "/") >= 4) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			paths = append(paths, rel)
 			return nil
-		}
-		rel, err := filepath.Rel(absRepo, p)
+		})
 		if err != nil {
-			return nil
+			return nil, nil, err
 		}
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			name := d.Name()
-			if rel != "." && (skipDirs[name] || (strings.HasPrefix(name, ".") && name != ".")) {
-				return filepath.SkipDir
-			}
-			if rel != "." && strings.Count(rel, "/") >= 4 {
-				return filepath.SkipDir
-			}
-			return nil
+	}
+	tree := make(map[string]bool, len(paths))
+	commands := make(map[string][]string)
+	python := make(map[string]int)
+	for _, rel := range paths {
+		tree[rel] = true
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		if (dir == "tools" || dir == "scripts") && strings.HasSuffix(rel, ".py") {
+			python[dir]++
 		}
-
-		if allowedFiles != nil && !allowedFiles[rel] {
-			return nil
+		if parent := filepath.ToSlash(filepath.Dir(dir)); filepath.Base(parent) == "cmd" && !slices.Contains(commands[filepath.ToSlash(filepath.Dir(parent))], dir) {
+			commands[filepath.ToSlash(filepath.Dir(parent))] = append(commands[filepath.ToSlash(filepath.Dir(parent))], dir)
+		}
+	}
+	for _, rel := range paths {
+		if !StaticComponentInput(rel) {
+			continue
 		}
 		dirRel := normalizeRoot(filepath.ToSlash(filepath.Dir(rel)))
-		base := d.Name()
-
+		base := filepath.Base(rel)
+		if !slices.Contains([]string{"go.mod", "package.json", "Cargo.toml", "pyproject.toml"}, base) && !strings.HasSuffix(base, ".uproject") {
+			continue
+		}
+		raw, err := read(rel, MaxStaticDiscoveryBytes)
+		if err != nil {
+			*discoveryErrors = append(*discoveryErrors, DiscoveryError{rel, err})
+			continue
+		}
+		if base == "package.json" && !json.Valid(raw) {
+			*discoveryErrors = append(*discoveryErrors, DiscoveryError{rel, errors.New("malformed JSON")})
+			continue
+		}
+		var item inferredItem
 		switch {
 		case base == "go.mod":
-			c, localDeps := parseGoMod(p, absRepo, dirRel, rel)
-			items = append(items, inferredItem{comp: c, localDeps: localDeps})
-			rootsWithManifest[dirRel] = true
+			item.comp, item.localDeps = parseGoMod(raw, absRepo, dirRel, rel, commands[dirRel])
 		case base == "package.json":
-			c, pkgName, deps := parsePackageJSON(p, absRepo, dirRel, rel)
-			items = append(items, inferredItem{comp: c, nodePkg: pkgName, nodeDeps: deps})
-			rootsWithManifest[dirRel] = true
+			item.comp, item.nodePkg, item.nodeDeps = parsePackageJSON(raw, dirRel, rel, tree[joinRel(dirRel, "tsconfig.json")], view)
 		case base == "Cargo.toml":
-			c, localDeps := parseCargoToml(p, absRepo, dirRel, rel)
-			items = append(items, inferredItem{comp: c, localDeps: localDeps})
-			rootsWithManifest[dirRel] = true
+			item.comp, item.localDeps = parseCargoToml(raw, dirRel, rel)
 		case base == "pyproject.toml":
-			items = append(items, inferredItem{comp: parsePyprojectToml(p, absRepo, dirRel, rel)})
-			rootsWithManifest[dirRel] = true
-		case strings.HasSuffix(base, ".uproject"):
-			c, gap := parseUProject(p, absRepo, dirRel, rel)
-			items = append(items, inferredItem{comp: c})
-			rootsWithManifest[dirRel] = true
-			if gap != "" {
-				gaps = append(gaps, gap)
+			item.comp = parsePyprojectToml(raw, dirRel, rel)
+		default:
+			var gap string
+			var err error
+			item.comp, gap, err = parseUProject(raw, dirRel, rel)
+			if err != nil {
+				*discoveryErrors = append(*discoveryErrors, DiscoveryError{rel, err})
+				continue
 			}
+			gaps = append(gaps, gap)
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
+		items = append(items, item)
+		rootsWithManifest[dirRel] = true
 	}
-
-	// Detect Python validator/tooling directories (`tools/`, `scripts/`) containing `*.py`
-	// when no pyproject.toml is present (common in game/native/scientific repos).
-	for _, candDir := range []string{"tools", "scripts"} {
-		if rootsWithManifest[candDir] {
-			continue
-		}
-		fullDir := filepath.Join(absRepo, candDir)
-		entries, err := os.ReadDir(fullDir)
-		if err != nil {
-			continue
-		}
-		pyCount := 0
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".py") &&
-				(allowedFiles == nil || allowedFiles[candDir+"/"+e.Name()]) {
-				pyCount++
-			}
-		}
-		if pyCount > 0 {
-			items = append(items, inferredItem{
-				comp: Component{
-					ID:          candDir + "-python",
-					Root:        candDir,
-					Kind:        "python-tooling",
-					Language:    "python",
-					Description: fmt.Sprintf("Python scripts/validators in %s/ (%d top-level .py files)", candDir, pyCount),
-					Paths:       []string{candDir + "/**"},
-					Provenance:  ProvenanceInferred,
-				},
-			})
+	for _, dir := range []string{"tools", "scripts"} {
+		if count := python[dir]; count > 0 && !rootsWithManifest[dir] {
+			items = append(items, inferredItem{comp: Component{
+				ID: dir + "-python", Root: dir, Kind: "python-tooling", Language: "python",
+				Description: fmt.Sprintf("Python scripts/validators in %s/ (%d top-level .py files)", dir, count),
+				Paths:       []string{dir + "/**"}, Provenance: ProvenanceInferred,
+			}})
 		}
 	}
 
@@ -519,11 +628,10 @@ func inferManifests(absRepo string, allowedFiles map[string]bool) ([]Component, 
 	return comps, gaps, nil
 }
 
-func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
+func parseGoMod(raw []byte, repoRoot, dirRel, rel string, entrypoints []string) (Component, []string) {
 	modName := ""
 	var localDeps []string
-	raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
-	if err == nil {
+	if raw != nil {
 		sc := bufio.NewScanner(strings.NewReader(string(raw)))
 		inReplace := false
 		for sc.Scan() {
@@ -566,19 +674,7 @@ func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
 		}
 	}
 	id := slugFromRootOrName(dirRel, filepath.Base(modName), "go-module")
-	var entrypoints []string
-	cmdDir := filepath.Join(filepath.Dir(fullPath), "cmd")
-	if entries, err := os.ReadDir(cmdDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				ep := filepath.ToSlash(filepath.Join(dirRel, "cmd", e.Name()))
-				if dirRel == "." {
-					ep = "cmd/" + e.Name()
-				}
-				entrypoints = append(entrypoints, ep)
-			}
-		}
-	}
+
 	return Component{
 		ID:           id,
 		Root:         dirRel,
@@ -592,7 +688,7 @@ func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
 	}, localDeps
 }
 
-func parsePackageJSON(fullPath, repoRoot, dirRel, rel string) (Component, string, []string) {
+func parsePackageJSON(raw []byte, dirRel, rel string, tsconfig bool, view *repoview.View) (Component, string, []string) {
 	type pkgJSON struct {
 		Name            string            `json:"name"`
 		Main            string            `json:"main"`
@@ -600,8 +696,10 @@ func parsePackageJSON(fullPath, repoRoot, dirRel, rel string) (Component, string
 		DevDependencies map[string]string `json:"devDependencies"`
 	}
 	var pj pkgJSON
-	if raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes); err == nil {
-		_ = json.Unmarshal(raw, &pj)
+	if view == nil || !view.CachedParse(rel, "package.json", &pj) {
+		if json.Unmarshal(raw, &pj) == nil && view != nil {
+			view.CacheParse(rel, "package.json", pj)
+		}
 	}
 	id := slugFromRootOrName(dirRel, pj.Name, "node-package")
 	var eps []string
@@ -609,7 +707,7 @@ func parsePackageJSON(fullPath, repoRoot, dirRel, rel string) (Component, string
 		eps = append(eps, joinRel(dirRel, pj.Main))
 	}
 	lang := "javascript"
-	if _, err := os.Stat(filepath.Join(filepath.Dir(fullPath), "tsconfig.json")); err == nil {
+	if tsconfig {
 		lang = "typescript"
 	} else if _, ok := pj.DevDependencies["typescript"]; ok {
 		lang = "typescript"
@@ -645,8 +743,7 @@ func isCargoDepSection(section string) bool {
 		strings.HasPrefix(s, "dependencies.") || strings.HasPrefix(s, "dev-dependencies.") || strings.HasPrefix(s, "build-dependencies.")
 }
 
-func parseCargoToml(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
-	raw, _ := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
+func parseCargoToml(raw []byte, dirRel, rel string) (Component, []string) {
 	name := extractTomlName(raw)
 	var localDeps []string
 	if raw != nil {
@@ -695,8 +792,7 @@ func parseCargoToml(fullPath, repoRoot, dirRel, rel string) (Component, []string
 	}, localDeps
 }
 
-func parsePyprojectToml(fullPath, repoRoot, dirRel, rel string) Component {
-	raw, _ := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
+func parsePyprojectToml(raw []byte, dirRel, rel string) Component {
 	name := extractTomlName(raw)
 	return Component{
 		ID:           slugFromRootOrName(dirRel, name, "python-package"),
@@ -710,7 +806,7 @@ func parsePyprojectToml(fullPath, repoRoot, dirRel, rel string) Component {
 	}
 }
 
-func parseUProject(fullPath, repoRoot, dirRel, rel string) (Component, string) {
+func parseUProject(raw []byte, dirRel, rel string) (Component, string, error) {
 	type uModule struct {
 		Name string `json:"Name"`
 		Type string `json:"Type"`
@@ -719,9 +815,12 @@ func parseUProject(fullPath, repoRoot, dirRel, rel string) (Component, string) {
 		EngineAssociation string    `json:"EngineAssociation"`
 		Modules           []uModule `json:"Modules"`
 	}
-	var up uProj
-	if raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes); err == nil {
-		_ = json.Unmarshal(raw, &up)
+	var up *uProj
+	if err := json.Unmarshal(raw, &up); err != nil {
+		return Component{}, "", err
+	}
+	if up == nil {
+		return Component{}, "", errors.New("expected an Unreal project object")
 	}
 	baseName := strings.TrimSuffix(filepath.Base(rel), ".uproject")
 	var eps []string
@@ -741,7 +840,7 @@ func parseUProject(fullPath, repoRoot, dirRel, rel string) (Component, string) {
 		Paths:        defaultPathsForRoot(dirRel),
 		ManifestFile: rel,
 		Provenance:   ProvenanceInferred,
-	}, gap
+	}, gap, nil
 }
 
 func extractTomlName(raw []byte) string {
@@ -787,11 +886,16 @@ func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, opts Build
 			return ps
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	parent := opts.Context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	cmd := shellcmd.CommandContext(ctx, p.Command)
 	cmd.Dir = repoDir
-	out, err := cmd.Output()
+	cmd.Env = shellcmd.Environment()
+	out, err := boundedProviderOutput(cmd)
 	if err != nil {
 		ps.Note = fmt.Sprintf("provider execution failed: %v", err)
 		return ps
@@ -902,4 +1006,26 @@ func mapKeysSorted(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Cap provider output before JSON decoding.
+func boundedProviderOutput(cmd *exec.Cmd) ([]byte, error) {
+	var data providerOutput
+	cmd.Stdout = &data
+	if err := shellcmd.Run(cmd); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		return nil, err
+	}
+	return data.Bytes(), nil
+}
+
+type providerOutput struct{ bytes.Buffer }
+
+func (p *providerOutput) Write(data []byte) (int, error) {
+	const maxOutput = 1 << 20
+	room := maxOutput - p.Len()
+	if len(data) > room {
+		n, _ := p.Buffer.Write(data[:room])
+		return n, fmt.Errorf("provider output exceeds %d bytes", maxOutput)
+	}
+	return p.Buffer.Write(data)
 }

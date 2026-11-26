@@ -13,6 +13,8 @@ import (
 
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/lockfile"
+	"github.com/Farzin312/waypost/internal/repopath"
+	"github.com/Farzin312/waypost/internal/repowrite"
 	"gopkg.in/yaml.v3"
 )
 
@@ -47,12 +49,20 @@ type Plan struct {
 }
 
 // Run computes a reviewable upgrade plan and, when opts.Apply is true, updates
-// .waypost.yaml (if Target changed) and .waypost.lock using exclusively created
-// temporary files with rollback on error so git revert remains clean.
+// .waypost.yaml and .waypost.lock through the recoverable policy writer.
 func Run(repoDir string, opts Options) (*Plan, error) {
+	var tx *repowrite.Transaction
+	if opts.Apply {
+		writer, close, err := repowrite.Acquire(repoDir)
+		if err != nil {
+			return nil, err
+		}
+		defer close()
+		tx = writer
+	}
 	readFile := opts.ReadFile
 	if readFile == nil {
-		readFile = func(repo, rel string) ([]byte, error) { return os.ReadFile(filepath.Join(repo, rel)) }
+		readFile = func(repo, rel string) ([]byte, error) { return repopath.Read(repo, rel, repopath.MaxPolicyBytes) }
 	}
 	cfgPath := filepath.Join(repoDir, config.ConfigFileName)
 	rawBefore, err := readFile(repoDir, config.ConfigFileName)
@@ -71,8 +81,13 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 
 	prevLockRaw, err := readFile(repoDir, lockfile.LockFileName)
-	if opts.ReadFile != nil && err != nil && !os.IsNotExist(err) {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read %s: %w", lockfile.LockFileName, err)
+	}
+	if os.IsNotExist(err) {
+		prevLockRaw = nil
+	} else if prevLockRaw == nil {
+		prevLockRaw = []byte{}
 	}
 	prevLock, prevLockDigest, _ := lockfile.ParseBytes(prevLockRaw)
 	pinnedPrev := lockfile.PinnedRemoteSHAs(prevLock)
@@ -84,7 +99,8 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	var upgradeWarnings []string
 	if len(pinnedPrev) > 0 {
 		beforeRes, err = config.Load(repoDir, config.LoadOptions{
-			Mode:                "ci",
+			Mode:                "local",
+			PinnedBuiltins:      lockfile.PinnedBuiltins(prevLock),
 			OverrideRootRaw:     rawBefore,
 			PinnedRemoteSHAs:    pinnedPrev,
 			RequirePinnedRemote: true,
@@ -97,7 +113,8 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 	if beforeRes == nil {
 		beforeRes, err = config.Load(repoDir, config.LoadOptions{
-			Mode:            "ci",
+			Mode:            "local",
+			PinnedBuiltins:  lockfile.PinnedBuiltins(prevLock),
 			OverrideRootRaw: rawBefore,
 			Offline:         opts.Offline,
 		})
@@ -121,10 +138,13 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 
 	afterLoadOpts := config.LoadOptions{
-		Mode:            "ci",
+		Mode:            "local",
 		OverrideRootRaw: rawAfter,
 		OverrideLabel:   cfgPath + " (candidate)",
 		Offline:         opts.Offline,
+	}
+	if strings.TrimSpace(opts.Target) == "" {
+		afterLoadOpts.PinnedBuiltins = lockfile.PinnedBuiltins(prevLock)
 	}
 	if opts.Offline || opts.CandidateConfig != nil {
 		afterLoadOpts.PinnedRemoteSHAs = pinnedPrev
@@ -171,7 +191,7 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		br, ok := beforeRules[id]
 		if !ok {
 			plan.AddedRules = append(plan.AddedRules, fmt.Sprintf("%s (%s)", id, ar.Kind))
-		} else if br != ar {
+		} else if !reflect.DeepEqual(br, ar) {
 			plan.ChangedRules = append(plan.ChangedRules, fmt.Sprintf("%s (%s -> %s)", id, br.Kind, ar.Kind))
 		}
 	}
@@ -196,8 +216,8 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 			plan.AddedChecks = append(plan.AddedChecks, fmt.Sprintf("%s (%s)", id, ac.Command))
 		} else if !checksEqual(bc, ac) {
 			plan.ChangedChecks = append(plan.ChangedChecks,
-				fmt.Sprintf("%s: cmd=%q->%q req=%v->%v timeout=%ds->%ds bin=%q->%q workdir=%q->%q",
-					id, bc.Command, ac.Command, bc.IsRequired(), ac.IsRequired(),
+				fmt.Sprintf("%s: cmd=%q->%q local_command=%q->%q serial=%v->%v req=%v->%v timeout=%ds->%ds bin=%q->%q workdir=%q->%q",
+					id, bc.Command, ac.Command, bc.LocalCommand, ac.LocalCommand, config.BoolVal(bc.Serial, true), config.BoolVal(ac.Serial, true), bc.IsRequired(), ac.IsRequired(),
 					bc.TimeoutSeconds, ac.TimeoutSeconds, bc.RequiresBin, ac.RequiresBin, bc.Workdir, ac.Workdir))
 		}
 	}
@@ -246,85 +266,30 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	cfgChanged := !bytes.Equal(rawBefore, rawAfter)
 	plan.Changed = cfgChanged || lockChanged
 
-	if opts.Apply && plan.Changed {
-		// Stage both files in exclusively created temp files before renaming.
-		var cfgTmp string
+	if tx != nil && plan.Changed {
+		var mutations []repowrite.Mutation
 		if cfgChanged {
-			var err error
-			cfgTmp, err = stageTempFile(repoDir, ".waypost-cfg-*.tmp", rawAfter)
-			if err != nil {
-				return nil, err
-			}
+			mutations = append(mutations, repowrite.Mutation{Path: config.ConfigFileName, Old: rawBefore, New: rawAfter})
+		} else if live, err := repowrite.Read(repoDir, config.ConfigFileName); err != nil || !repowrite.Same(live, rawBefore) {
+			return nil, fmt.Errorf("%s changed during upgrade", config.ConfigFileName)
 		}
-		lockTmp, err := stageTempFile(repoDir, ".waypost-lock-*.tmp", newLockBytes)
-		if err != nil {
-			if cfgTmp != "" {
-				_ = os.Remove(cfgTmp)
-			}
+		if lockChanged {
+			mutations = append(mutations, repowrite.Mutation{Path: lockfile.LockFileName, Old: prevLockRaw, New: newLockBytes})
+		}
+		if err := tx.Commit(mutations...); err != nil {
 			return nil, err
-		}
-
-		if cfgTmp != "" {
-			if err := os.Rename(cfgTmp, cfgPath); err != nil {
-				_ = os.Remove(cfgTmp)
-				_ = os.Remove(lockTmp)
-				return nil, fmt.Errorf("publish updated config: %w", err)
-			}
-		}
-		lockPath := filepath.Join(repoDir, lockfile.LockFileName)
-		if err := os.Rename(lockTmp, lockPath); err != nil {
-			_ = os.Remove(lockTmp)
-			// Roll back config file if lock publish failed.
-			if cfgChanged {
-				if rollback, rollbackErr := stageTempFile(repoDir, ".waypost-cfg-*.tmp", rawBefore); rollbackErr == nil {
-					defer os.Remove(rollback)
-					if rollbackErr := os.Rename(rollback, cfgPath); rollbackErr != nil {
-						return nil, fmt.Errorf("publish lockfile: %w; restore config: %v", err, rollbackErr)
-					}
-				} else {
-					return nil, fmt.Errorf("publish lockfile: %w; stage config rollback: %v", err, rollbackErr)
-				}
-			}
-			return nil, fmt.Errorf("publish updated lockfile: %w", err)
 		}
 		plan.Applied = true
 	}
-
 	return plan, nil
 }
 
 func checksEqual(a, b config.Check) bool {
-	return a.Command == b.Command &&
-		a.Workdir == b.Workdir &&
-		a.IsRequired() == b.IsRequired() &&
-		a.TimeoutSeconds == b.TimeoutSeconds &&
-		a.RequiresBin == b.RequiresBin &&
-		a.Description == b.Description &&
-		reflect.DeepEqual(a.Paths, b.Paths) &&
-		reflect.DeepEqual(a.Components, b.Components)
-}
-
-func stageTempFile(dir, pattern string, content []byte) (string, error) {
-	f, err := os.CreateTemp(dir, pattern)
-	if err != nil {
-		return "", fmt.Errorf("create temp file: %w", err)
+	if a.IsRequired() != b.IsRequired() || config.BoolVal(a.Serial, true) != config.BoolVal(b.Serial, true) {
+		return false
 	}
-	name := f.Name()
-	if _, err := f.Write(content); err != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return "", fmt.Errorf("write temp file: %w", err)
-	}
-	if err := f.Chmod(0o644); err != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return "", fmt.Errorf("chmod temp file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(name)
-		return "", fmt.Errorf("close temp file: %w", err)
-	}
-	return name, nil
+	a.Required, b.Required, a.Serial, b.Serial = nil, nil, nil, nil
+	return reflect.DeepEqual(a, b)
 }
 
 // replaceExtendsField updates or inserts `extends` in a YAML document, safely replacing

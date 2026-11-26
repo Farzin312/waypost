@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Farzin312/waypost/blob/main/schemas/pins.v1.schema.json",
+  "title": "Waypost Pin Reconciliation v1",
+  "type": "object",
+  "properties": {
+    "pins_version": {
+      "const": "1"
+    },
+    "snapshots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "worktree",
+              "commit"
+            ]
+          },
+          "sha": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "repo": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "kind",
+          "repo"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "pins": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pin"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "pins_version",
+    "snapshots",
+    "pins",
+    "diagnostics"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "pin": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "producer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "consumer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string"
+        },
+        "compatibility_check": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contract_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "producer",
+            "consumer"
+          ]
+        },
+        "consumer_component": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "npm-package-version",
+                "npm-dependency"
+              ]
+            },
+            "manifest": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^/\\\\:\\x00]+(/[^/\\\\:\\x00]+)*$",
+              "not": {
+                "pattern": "(^|/)\\.{1,2}(/|$)|^\\.[gG][iI][tT](/|$)"
+              }
+            },
+            "package": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "manifest"
+          ],
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "npm-dependency"
+                }
+              },
+              "required": [
+                "package"
+              ]
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "npm-package-version"
+                }
+              },
+              "not": {
+                "required": [
+                  "package"
+                ]
+              }
+            }
+          ]
+        },
+        "snapshot": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "declared_version": {
+          "type": "string"
+        },
+        "observed_version": {
+          "type": "string"
+        },
+        "artifact_identity": {
+          "type": "string"
+        },
+        "integrity": {
+          "type": "string"
+        },
+        "release_line": {
+          "type": "string"
+        },
+        "producer_version": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "aligned",
+            "unknown",
+            "drift",
+            "behind"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "producer",
+        "artifact",
+        "consumer",
+        "status",
+        "snapshot"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

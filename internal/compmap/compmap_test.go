@@ -52,10 +52,10 @@ func TestBuildPolyglotAndReverseDependencyImpact(t *testing.T) {
 		SchemaVersion: "1",
 		Components: []config.ComponentConfig{
 			{
-				ID:        "data",
-				Root:      "data",
-				Language:  "json",
-				Paths:     []string{"data/**"},
+				ID:       "data",
+				Root:     "data",
+				Language: "json",
+				Paths:    []string{"data/**"},
 			},
 			{
 				ID:        "game",

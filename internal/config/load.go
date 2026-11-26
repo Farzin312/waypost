@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Farzin312/waypost/internal/presets"
 	"github.com/Farzin312/waypost/internal/remote"
+	"github.com/Farzin312/waypost/internal/repopath"
 	"github.com/Farzin312/waypost/internal/version"
 	"gopkg.in/yaml.v3"
 )
@@ -29,7 +33,9 @@ type ReadRepoFileFunc func(relPath string) ([]byte, bool, error)
 type LoadOptions struct {
 	// Mode is "local" (default) or "ci". In "ci" mode, .waypost.local.yaml is never opened or applied.
 	Mode string
-	// OverrideRootRaw, when non-empty, parses this raw YAML instead of reading <repoDir>/.waypost.yaml.
+	// HasRootBytes distinguishes a supplied empty document from a filesystem read.
+	HasRootBytes bool
+	// OverrideRootRaw contains the supplied YAML document.
 	OverrideRootRaw []byte
 	// OverrideLabel is used in error messages when OverrideRootRaw is set.
 	OverrideLabel string
@@ -37,11 +43,15 @@ type LoadOptions struct {
 	// (e.g. `git show <baseTip>:<relPath>`) instead of the live worktree.
 	RepoFileReader ReadRepoFileFunc
 	// PinnedRemoteSHAs maps remote `extends` refs to their expected SHA-256 digests from .waypost.lock.
-	PinnedRemoteSHAs map[string]string
+	PinnedRemoteSHAs     map[string]string
+	PinnedBuiltins       map[string]string
+	RequireBuiltinAnchor bool
 	// RequirePinnedRemote fails closed if a remote `extends` ref is not present in PinnedRemoteSHAs.
 	RequirePinnedRemote bool
 	// Offline restricts remote preset resolution to the verified local content-addressed cache.
 	Offline bool
+	// ReadOnly prevents remote downloads from updating the local cache.
+	ReadOnly bool
 }
 
 // ParseBytes unmarshals and validates a single config YAML document.
@@ -51,6 +61,9 @@ func ParseBytes(raw []byte, label string) (*Config, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", label, err)
+	}
+	if err := dec.Decode(new(yaml.Node)); err != io.EOF {
+		return nil, fmt.Errorf("parse %s: expected one YAML document", label)
 	}
 	if err := validateSingle(&cfg, label); err != nil {
 		return nil, err
@@ -78,13 +91,13 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	var rootRaw []byte
 	rootPath := filepath.Join(absRepo, ConfigFileName)
 	label := rootPath
-	if len(opts.OverrideRootRaw) > 0 {
+	if opts.HasRootBytes || opts.OverrideRootRaw != nil {
 		rootRaw = opts.OverrideRootRaw
 		if opts.OverrideLabel != "" {
 			label = opts.OverrideLabel
 		}
 	} else {
-		rootRaw, err = os.ReadFile(rootPath)
+		rootRaw, err = repopath.Read(absRepo, ConfigFileName, repopath.MaxPolicyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", rootPath, err)
 		}
@@ -115,6 +128,9 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	var repoAncestorTrustPaths []string
 
 	for nextRef != "" {
+		if len(layers) >= 64 {
+			return nil, fmt.Errorf("preset inheritance exceeds 64 layers")
+		}
 		parentCfg, step, parentDir, parentRelDir, visitKey, repoRelPath, isRemoteParent, err := resolveParent(
 			nextRef, absRepo, currDir, currRelDir, mode, fromRemote, opts,
 		)
@@ -138,7 +154,21 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	var effective Config
 	effective.SchemaVersion = version.SchemaVersion
 	chain := make([]InheritanceStep, 0, len(layers)-1)
+	origins := make(map[string]RuleOrigin)
+	recordOrigins := func(cfg *Config, source string) {
+		for _, rule := range cfg.Rules {
+			origins[rule.ID] = RuleOrigin{Source: source, Overrides: origins[rule.ID].Source}
+		}
+		for _, id := range cfg.DisableRules {
+			delete(origins, id)
+		}
+	}
 	for i := len(layers) - 1; i >= 0; i-- {
+		source := ConfigFileName
+		if layers[i].step != nil {
+			source = layers[i].step.Ref
+		}
+		recordOrigins(layers[i].cfg, source)
 		if layers[i].step != nil {
 			chain = append(chain, *layers[i].step)
 		}
@@ -152,14 +182,14 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	// In CI mode, never open or read .waypost.local.yaml (only Lstat to report ignored=true).
 	localApplied := false
 	localIgnored := false
-	if len(opts.OverrideRootRaw) == 0 {
+	if !opts.HasRootBytes && opts.OverrideRootRaw == nil {
 		localPath := filepath.Join(absRepo, LocalConfigFileName)
 		if mode == "ci" {
 			if _, statErr := os.Lstat(localPath); statErr == nil {
 				localIgnored = true
 			}
 		} else {
-			if localRaw, err := os.ReadFile(localPath); err == nil {
+			if localRaw, err := repopath.Read(absRepo, LocalConfigFileName, repopath.MaxPolicyBytes); err == nil {
 				localCfg, err := ParseBytes(localRaw, localPath)
 				if err != nil {
 					return nil, fmt.Errorf("invalid local override %s: %w", localPath, err)
@@ -167,6 +197,7 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 				if strings.TrimSpace(localCfg.Extends) != "" {
 					return nil, fmt.Errorf("%s may not declare extends", localPath)
 				}
+				recordOrigins(localCfg, LocalConfigFileName)
 				effective = mergeConfigs(effective, *localCfg)
 				localApplied = true
 			} else if !errors.Is(err, os.ErrNotExist) {
@@ -211,12 +242,17 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 		LocalOverrideApplied: localApplied,
 		LocalOverrideIgnored: localIgnored,
 		RawRootSHA256:        rootSum,
+		RuleOrigins:          origins,
 	}, nil
 }
 
 func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bool, opts LoadOptions) (*Config, *InheritanceStep, string, string, string, string, bool, error) {
 	if presets.IsBuiltin(ref) {
-		b, err := presets.Resolve(ref)
+		anchored := presets.Anchor(ref, opts.PinnedBuiltins)
+		if opts.RequireBuiltinAnchor && presets.Floating(anchored) {
+			return nil, nil, "", "", "", "", false, fmt.Errorf("historical builtin %q requires an exact lock anchor", ref)
+		}
+		b, err := presets.Resolve(anchored)
 		if err != nil {
 			return nil, nil, "", "", "", "", false, err
 		}
@@ -224,13 +260,16 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bo
 		if err != nil {
 			return nil, nil, "", "", "", "", false, err
 		}
+		if cfg.PresetVersion != b.Version {
+			return nil, nil, "", "", "", "", false, fmt.Errorf("builtin %s version is %q", b.Ref, cfg.PresetVersion)
+		}
 		step := &InheritanceStep{
 			Ref:     b.Ref,
 			Source:  "builtin",
 			Version: b.Version,
 			SHA256:  b.SHA256,
 		}
-		return cfg, step, baseDir, baseRelDir, "builtin:" + b.Name, "", false, nil
+		return cfg, step, baseDir, baseRelDir, b.Ref, "", false, nil
 	}
 
 	if remote.IsRemote(ref) {
@@ -241,7 +280,11 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bo
 		if opts.RequirePinnedRemote && !remote.IsValidSHA256Hex(expectedSHA) {
 			return nil, nil, "", "", "", "", true, fmt.Errorf("remote preset %q is not validly SHA-256 pinned in .waypost.lock (run `waypost upgrade --apply`)", ref)
 		}
-		r, err := remote.Fetch(ref, expectedSHA, opts.Offline)
+		fetch := remote.Fetch
+		if opts.ReadOnly {
+			fetch = remote.FetchReadOnly
+		}
+		r, err := fetch(ref, expectedSHA, opts.Offline)
 		if err != nil {
 			return nil, nil, "", "", "", "", true, err
 		}
@@ -299,20 +342,7 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bo
 			}
 			return cfg, step, baseDir, filepath.ToSlash(filepath.Dir(joinedRel)), "repo:" + joinedRel, joinedRel, false, nil
 		}
-		extPath := ref
-		if !filepath.IsAbs(extPath) {
-			extPath = filepath.Join(baseDir, extPath)
-		}
-		realExt, err := filepath.EvalSymlinks(extPath)
-		if err != nil {
-			return nil, nil, "", "", "", "", false, fmt.Errorf("resolve external extends preset %q: %w", ref, err)
-		}
-		realRepo, err := filepath.EvalSymlinks(absRepo)
-		if err == nil {
-			if rel, relErr := filepath.Rel(realRepo, realExt); relErr == nil && !strings.HasPrefix(rel, "..") {
-				return nil, nil, "", "", "", "", false, fmt.Errorf("external extends path %q symlinks back into PR repository", ref)
-			}
-		}
+		return nil, nil, "", "", "", "", false, fmt.Errorf("external extends path %q is not permitted for a trusted snapshot", ref)
 	}
 
 	p := ref
@@ -327,7 +357,16 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bo
 		return nil, nil, "", "", "", "", false, fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
 	}
 
-	raw, err := os.ReadFile(absPath)
+	rel, relErr := filepath.Rel(absRepo, absPath)
+	inRepo := relErr == nil && repopath.Valid(filepath.ToSlash(rel))
+	if mode == "ci" && !inRepo {
+		return nil, nil, "", "", "", "", false, fmt.Errorf("external extends path %q is not permitted in CI", ref)
+	}
+	readRoot, readPath := absRepo, filepath.ToSlash(rel)
+	if !inRepo {
+		readRoot, readPath = filepath.Dir(absPath), filepath.Base(absPath)
+	}
+	raw, err := repopath.Read(readRoot, readPath, repopath.MaxPolicyBytes)
 	if err != nil {
 		return nil, nil, "", "", "", "", false, fmt.Errorf("read extends preset %q (%s): %w", ref, absPath, err)
 	}
@@ -353,19 +392,54 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bo
 	return cfg, step, filepath.Dir(absPath), filepath.Dir(repoRelPath), "file:" + filepath.Clean(absPath), repoRelPath, false, nil
 }
 
+var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 func validateSingle(cfg *Config, label string) error {
 	if cfg.SchemaVersion != "" && cfg.SchemaVersion != version.SchemaVersion {
 		return fmt.Errorf("%s: unsupported schema_version %q (supported: %q)", label, cfg.SchemaVersion, version.SchemaVersion)
+	}
+	for _, entry := range cfg.Rules {
+		if !safeID.MatchString(entry.ID) {
+			return fmt.Errorf("%s: invalid rule ID %q", label, entry.ID)
+		}
 	}
 	if err := checkDuplicateIDs(label, "rule", len(cfg.Rules), func(i int) string { return cfg.Rules[i].ID }); err != nil {
 		return err
 	}
 	for _, r := range cfg.Rules {
+		if r.ReviewAfter != "" {
+			if _, err := time.Parse(time.DateOnly, r.ReviewAfter); err != nil {
+				return fmt.Errorf("%s: rule %q has invalid review_after: %w", label, r.ID, err)
+			}
+		}
 		if r.Kind != "invariant" && r.Kind != "crutch" {
 			return fmt.Errorf("%s: rule %q has invalid kind %q (must be \"invariant\" or \"crutch\")", label, r.ID, r.Kind)
 		}
+		if r.VerifiedBy != nil {
+			proof := r.VerifiedBy
+			if len(proof.Checks)+len(proof.Tests) == 0 {
+				return fmt.Errorf("%s: rule %q requires at least one verified_by link", label, r.ID)
+			}
+			for _, links := range [][]string{proof.Checks, proof.Tests} {
+				if err := checkDuplicateIDs(label, "proof link", len(links), func(i int) string {
+					return strings.TrimPrefix(links[i], "./")
+				}); err != nil {
+					return err
+				}
+			}
+			for _, glob := range proof.Tests {
+				if err := repopath.ValidateGlob(glob); err != nil {
+					return fmt.Errorf("rule %q: %w", r.ID, err)
+				}
+			}
+		}
 		if strings.TrimSpace(r.Summary) == "" {
 			return fmt.Errorf("%s: rule %q requires a non-empty summary", label, r.ID)
+		}
+	}
+	for _, entry := range cfg.Components {
+		if !safeID.MatchString(entry.ID) {
+			return fmt.Errorf("%s: invalid component ID %q", label, entry.ID)
 		}
 	}
 	if err := checkDuplicateIDs(label, "component", len(cfg.Components), func(i int) string { return cfg.Components[i].ID }); err != nil {
@@ -376,18 +450,42 @@ func validateSingle(cfg *Config, label string) error {
 			return fmt.Errorf("%s: component %q requires a non-empty root", label, c.ID)
 		}
 	}
+	for _, entry := range cfg.Pins {
+		if !safeID.MatchString(entry.ID) {
+			return fmt.Errorf("%s: invalid pin ID %q", label, entry.ID)
+		}
+	}
 	if err := checkDuplicateIDs(label, "pin", len(cfg.Pins), func(i int) string { return cfg.Pins[i].ID }); err != nil {
 		return err
 	}
 	for _, p := range cfg.Pins {
+		if p.Role != "" && p.Role != "producer" && p.Role != "consumer" {
+			return fmt.Errorf("pin %q has invalid role %q", p.ID, p.Role)
+		}
+		if src := p.Source; src != nil {
+			if !repopath.Valid(src.Manifest) ||
+				(src.Kind != "npm-package-version" && src.Kind != "npm-dependency") ||
+				(src.Kind == "npm-dependency" && strings.TrimSpace(src.Package) == "") ||
+				(src.Kind == "npm-package-version" && src.Package != "") {
+				return fmt.Errorf("pin %q has invalid source", p.ID)
+			}
+		}
 		if strings.TrimSpace(p.Producer) == "" || strings.TrimSpace(p.Artifact) == "" || strings.TrimSpace(p.Consumer) == "" {
 			return fmt.Errorf("%s: pin %q requires non-empty producer, artifact, and consumer", label, p.ID)
+		}
+	}
+	for _, entry := range cfg.Checks {
+		if !safeID.MatchString(entry.ID) {
+			return fmt.Errorf("%s: invalid check ID %q", label, entry.ID)
 		}
 	}
 	if err := checkDuplicateIDs(label, "check", len(cfg.Checks), func(i int) string { return cfg.Checks[i].ID }); err != nil {
 		return err
 	}
 	for _, c := range cfg.Checks {
+		if c.TimeoutSeconds < 0 || (c.Workdir != "" && c.Workdir != "." && !repopath.Valid(c.Workdir)) {
+			return fmt.Errorf("check %q has invalid timeout or workdir", c.ID)
+		}
 		if strings.TrimSpace(c.Command) == "" {
 			return fmt.Errorf("%s: check %q requires a non-empty command", label, c.ID)
 		}
@@ -434,6 +532,44 @@ func validateSingle(cfg *Config, label string) error {
 				return fmt.Errorf("%s: boundary rule %q requires a non-empty public_entrypoints list", label, rule.ID)
 			case !dependencies && !entrypoints:
 				return fmt.Errorf("%s: boundary rule %q requires a dependency or public entrypoint constraint", label, rule.ID)
+			}
+		}
+	}
+	return validateGlobs(cfg)
+}
+
+func validateGlobs(cfg *Config) error {
+	groups := [][]string{cfg.Policy.TrustPaths}
+	for _, c := range cfg.Components {
+		if c.Root != "." && !repopath.Valid(c.Root) {
+			return fmt.Errorf("component %q has invalid root %q", c.ID, c.Root)
+		}
+		groups = append(groups, c.Paths, c.Entrypoints, c.TrustPaths)
+	}
+	for _, c := range cfg.Checks {
+		groups = append(groups, c.Paths)
+	}
+	for _, p := range cfg.Pins {
+		groups = append(groups, p.Paths)
+	}
+	if b := cfg.Boundaries; b != nil {
+		groups = append(groups, b.IgnorePaths)
+		for _, r := range b.Rules {
+			groups = append(groups, r.PublicEntrypoints, r.DenyDependsOn)
+			if r.AllowDependsOn != nil {
+				groups = append(groups, *r.AllowDependsOn)
+			}
+			for _, pattern := range []string{r.From, r.Target} {
+				if pattern != "" {
+					groups = append(groups, []string{pattern})
+				}
+			}
+		}
+	}
+	for _, group := range groups {
+		for _, pattern := range group {
+			if err := repopath.ValidateGlob(pattern); err != nil {
+				return err
 			}
 		}
 	}
@@ -491,6 +627,15 @@ func validateEffective(cfg *Config) error {
 	checkIDs := make(map[string]bool, len(cfg.Checks))
 	for _, c := range cfg.Checks {
 		checkIDs[c.ID] = true
+	}
+	for _, rule := range cfg.Rules {
+		if rule.VerifiedBy != nil {
+			for _, id := range rule.VerifiedBy.Checks {
+				if !checkIDs[id] {
+					return fmt.Errorf("rule %q references unknown verified_by check %q", rule.ID, id)
+				}
+			}
+		}
 	}
 	for _, comp := range cfg.Components {
 		for _, cid := range comp.Checks {

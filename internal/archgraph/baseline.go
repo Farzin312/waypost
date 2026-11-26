@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 
-	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
+	"github.com/Farzin312/waypost/internal/repopath"
+	"github.com/Farzin312/waypost/internal/repowrite"
 )
 
 const MaxBaselineBytes = 4 * 1024 * 1024
@@ -53,6 +53,9 @@ func baselineEntry(v Violation) BaselineEntry {
 	e := BaselineEntry{
 		Kind: v.Kind, RuleID: v.RuleID, From: v.From, To: v.To,
 		Source: normalizeFile(v.File), Target: normalizeFile(v.TargetFile),
+	}
+	if v.TargetPackageDir != "" {
+		e.Target = normalizeFile(v.TargetPackageDir)
 	}
 	if v.Kind == "cycle" {
 		e.To, e.Source, e.Target = "", "", ""
@@ -151,7 +154,7 @@ func ParseBaseline(raw []byte) (*BaselineFile, error) {
 			} else {
 				entry.canonicalizeCycle()
 			}
-			if len(entry.CycleMembers) == 0 || len(entry.CycleEdges) == 0 {
+			if !validCycle(*entry) {
 				return nil, fmt.Errorf("invalid baseline cycle %q", entry.Fingerprint)
 			}
 		}
@@ -162,6 +165,9 @@ func ParseBaseline(raw []byte) (*BaselineFile, error) {
 			return nil, fmt.Errorf("duplicate baseline fingerprint %q", entry.Fingerprint)
 		}
 		seen[entry.Fingerprint] = true
+		if entry.Count < 0 {
+			return nil, fmt.Errorf("baseline entry %q has negative count", entry.Fingerprint)
+		}
 		if entry.Occurrences() > math.MaxInt-total {
 			return nil, errors.New("baseline occurrence counts exceed the supported total")
 		}
@@ -170,23 +176,63 @@ func ParseBaseline(raw []byte) (*BaselineFile, error) {
 	return &baseline, nil
 }
 
+func validCycle(entry BaselineEntry) bool {
+	if len(entry.CycleMembers) == 0 || len(entry.CycleEdges) == 0 {
+		return false
+	}
+	members := make(map[string]bool)
+	for _, member := range entry.CycleMembers {
+		if member == "" || members[member] {
+			return false
+		}
+		members[member] = true
+	}
+	forward, reverse := make(map[string][]string), make(map[string][]string)
+	seen := make(map[CycleEdge]bool)
+	for _, edge := range entry.CycleEdges {
+		if seen[edge] || !members[edge.From] || !members[edge.To] {
+			return false
+		}
+		seen[edge] = true
+		forward[edge.From] = append(forward[edge.From], edge.To)
+		reverse[edge.To] = append(reverse[edge.To], edge.From)
+	}
+	for _, adj := range []map[string][]string{forward, reverse} {
+		reached := make(map[string]bool)
+		queue := []string{entry.CycleMembers[0]}
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			if reached[id] {
+				continue
+			}
+			reached[id] = true
+			queue = append(queue, adj[id]...)
+		}
+		if len(reached) != len(members) {
+			return false
+		}
+	}
+	return true
+}
+
 func LoadBaseline(repoRoot, relPath string) (*BaselineFile, error) {
 	if err := config.ValidateBaselinePath(repoRoot, relPath); err != nil {
 		return nil, err
 	}
-	raw, err := compmap.ReadBoundedRegularFile(repoRoot, filepath.Join(repoRoot, relPath), MaxBaselineBytes)
+	raw, err := repopath.Read(repoRoot, relPath, MaxBaselineBytes)
 	if err != nil {
 		return nil, err
 	}
 	return ParseBaseline(raw)
 }
 
-func SaveBaseline(repoRoot, relPath string, violations []Violation) error {
+func EncodeBaseline(violations []Violation) ([]byte, error) {
 	baseline := BaselineFile{SchemaVersion: "1", Entries: make([]BaselineEntry, 0, len(violations))}
 	positions := make(map[string]int, len(violations))
 	for _, v := range violations {
 		if v.Kind == "scan-error" {
-			return errors.New("cannot save an incomplete boundary scan")
+			return nil, errors.New("cannot save an incomplete boundary scan")
 		}
 		entry := baselineEntry(v)
 		if i, ok := positions[entry.Fingerprint]; ok {
@@ -204,74 +250,42 @@ func SaveBaseline(repoRoot, relPath string, violations []Violation) error {
 	})
 	raw, err := json.MarshalIndent(baseline, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	raw = append(raw, '\n')
 	if len(raw) > MaxBaselineBytes {
-		return fmt.Errorf("baseline exceeds %d bytes", MaxBaselineBytes)
+		return nil, fmt.Errorf("baseline exceeds %d bytes", MaxBaselineBytes)
 	}
-	root, err := openBaselineForEdit(repoRoot, relPath)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	if err := root.MkdirAll(filepath.Dir(relPath), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(repoRoot, ".waypost-baseline-*.tmp")
-	if err != nil {
-		return err
-	}
-	defer root.Remove(filepath.Base(tmp.Name()))
-	_, writeErr := tmp.Write(raw)
-	closeErr := tmp.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		return err
-	}
-	return root.Rename(filepath.Base(tmp.Name()), relPath)
+	return raw, nil
 }
 
-// RemoveBaseline removes a baseline after a complete scan finds no violations.
+func SaveBaseline(repoRoot, relPath string, violations []Violation) error {
+	raw, err := EncodeBaseline(violations)
+	if err != nil {
+		return err
+	}
+	return writeBaseline(repoRoot, relPath, raw)
+}
+
+// RemoveBaseline removes a recorded baseline under the shared writer lock.
 func RemoveBaseline(repoRoot, relPath string) error {
-	root, err := openBaselineForEdit(repoRoot, relPath)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	if err := root.Remove(relPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return writeBaseline(repoRoot, relPath, nil)
 }
 
-func openBaselineForEdit(repoRoot, relPath string) (*os.Root, error) {
-	if err := config.ValidateBaselinePath(repoRoot, relPath); err != nil {
-		return nil, err
-	}
-	root, err := os.OpenRoot(repoRoot)
+func writeBaseline(repoRoot, relPath string, raw []byte) error {
+	tx, close, err := repowrite.Acquire(repoRoot)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	target := filepath.FromSlash(relPath)
-	for prefix := target; prefix != "."; prefix = filepath.Dir(prefix) {
-		info, err := root.Lstat(prefix)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err == nil {
-			switch {
-			case prefix == target && !info.Mode().IsRegular():
-				err = fmt.Errorf("baseline %q is not a regular file", relPath)
-			case prefix != target && !info.IsDir():
-				err = fmt.Errorf("baseline parent %q is not a real directory", prefix)
-			}
-		}
-		if err != nil {
-			root.Close()
-			return nil, err
-		}
+	defer close()
+	if err := config.ValidateBaselinePath(repoRoot, relPath); err != nil {
+		return err
 	}
-	return root, nil
+	old, err := repowrite.Read(repoRoot, relPath)
+	if err != nil || repowrite.Same(old, raw) {
+		return err
+	}
+	return tx.Commit(repowrite.Mutation{Path: relPath, Old: old, New: raw})
 }
 
 // EvaluateBoundariesWithBaseline partitions a live ratchet report. A nil baseline
@@ -281,15 +295,10 @@ func EvaluateBoundariesWithBaseline(report *Report, baseline *BaselineFile) {
 		report.addBaselineError("", errors.New("ratchet requires a valid boundary baseline"))
 		return
 	}
-	remaining := make(map[string]int, len(baseline.Entries))
-	for _, e := range baseline.Entries {
-		remaining[e.Fingerprint] = e.Occurrences()
-	}
+	allowances := newAllowances(baseline)
 	live := report.Violations[:0]
 	for _, v := range report.Violations {
-		key := ViolationFingerprint(v)
-		if remaining[key] > 0 && v.Kind != "scan-error" {
-			remaining[key]--
+		if v.Kind != "scan-error" && allowances.consumeViolation(&v) {
 			report.grandfathered = append(report.grandfathered, v)
 		} else {
 			live = append(live, v)
@@ -297,9 +306,161 @@ func EvaluateBoundariesWithBaseline(report *Report, baseline *BaselineFile) {
 	}
 	report.Violations = live
 	report.GrandfatheredCount = len(report.grandfathered)
-	for _, count := range remaining {
-		report.ResolvedBaselineCount += count
+	report.ResolvedBaselineCount = allowances.remaining()
+}
+
+// BaselineExpansion counts candidate occurrences outside the trusted allowances.
+func BaselineExpansion(old, candidate *BaselineFile) int {
+	allowances := newAllowances(old)
+	added := 0
+	entries := slices.Clone(candidate.Entries)
+	// Prefer exact/larger SCCs before assigning split cycles.
+	slices.SortStableFunc(entries, func(a, b BaselineEntry) int { return len(b.CycleEdges) - len(a.CycleEdges) })
+	for _, e := range entries {
+		used := allowances.consume(e)
+		if used < e.Occurrences() && strings.HasSuffix(e.Source, ".go") {
+			legacy, _ := allowances.consumeLegacyGo(e, e.Occurrences()-used)
+			used += legacy
+		}
+		added += e.Occurrences() - used
 	}
+	return added
+}
+
+type cycleAllowance struct {
+	entry   BaselineEntry
+	members map[string]int
+	edges   map[CycleEdge]int
+	used    int
+}
+
+type allowances struct {
+	exact       map[string]int
+	goWitnesses map[string][]BaselineEntry
+	cycles      []cycleAllowance
+}
+
+func newAllowances(b *BaselineFile) *allowances {
+	a := &allowances{exact: make(map[string]int), goWitnesses: make(map[string][]BaselineEntry)}
+	if b == nil {
+		return a
+	}
+	for _, e := range b.Entries {
+		if e.Kind != "cycle" {
+			a.exact[e.Fingerprint] = e.Occurrences()
+			if strings.HasSuffix(e.Source, ".go") && strings.HasSuffix(e.Target, ".go") {
+				packageEntry := e
+				packageEntry.Target = path.Dir(e.Target)
+				key := packageEntry.digest()
+				a.goWitnesses[key] = append(a.goWitnesses[key], e)
+			}
+			continue
+		}
+		c := cycleAllowance{entry: e, members: make(map[string]int), edges: make(map[CycleEdge]int)}
+		for _, member := range e.CycleMembers {
+			c.members[member] = 0
+		}
+		for _, edge := range e.CycleEdges {
+			c.edges[edge] = 0
+		}
+		a.cycles = append(a.cycles, c)
+	}
+	return a
+}
+
+func (a *allowances) consumeViolation(v *Violation) bool {
+	e := baselineEntry(*v)
+	if a.consume(e) == 1 {
+		return true
+	}
+	if v.TargetPackageDir == "" {
+		return false
+	}
+	if n, witness := a.consumeLegacyGo(e, 1); n == 1 {
+		v.TargetPackageDir, v.TargetFile = "", witness
+		return true
+	}
+	return false
+}
+
+func (a *allowances) consumeLegacyGo(e BaselineEntry, n int) (used int, witness string) {
+	for _, legacy := range a.goWitnesses[e.Fingerprint] {
+		matched := min(a.exact[legacy.Fingerprint], n-used)
+		if matched == 0 {
+			continue
+		}
+		a.exact[legacy.Fingerprint] -= matched
+		used += matched
+		witness = legacy.Target
+		if used == n {
+			break
+		}
+	}
+	return used, witness
+}
+
+func (a *allowances) consume(e BaselineEntry) int {
+	n := e.Occurrences()
+	if e.Kind != "cycle" {
+		used := min(a.exact[e.Fingerprint], n)
+		a.exact[e.Fingerprint] -= used
+		return used
+	}
+	if len(e.CycleMembers) == 0 || len(e.CycleEdges) == 0 {
+		return 0
+	}
+	chosen, consumed := -1, 0
+	for i, c := range a.cycles {
+		if c.entry.RuleID != e.RuleID {
+			continue
+		}
+		capacity := min(c.entry.Occurrences(), n)
+		for _, member := range e.CycleMembers {
+			used, ok := c.members[member]
+			if !ok {
+				capacity = 0
+				break
+			}
+			capacity = min(capacity, c.entry.Occurrences()-used)
+		}
+		for _, edge := range e.CycleEdges {
+			used, ok := c.edges[edge]
+			if !ok {
+				capacity = 0
+				break
+			}
+			capacity = min(capacity, c.entry.Occurrences()-used)
+		}
+		if capacity > consumed {
+			chosen, consumed = i, capacity
+			if consumed == n {
+				break
+			}
+		}
+	}
+	if chosen < 0 {
+		return 0
+	}
+	c := &a.cycles[chosen]
+	for _, member := range e.CycleMembers {
+		c.members[member] += consumed
+		c.used = max(c.used, c.members[member])
+	}
+	for _, edge := range e.CycleEdges {
+		c.edges[edge] += consumed
+	}
+	return consumed
+}
+
+func (a *allowances) remaining() int {
+	n := 0
+	for _, left := range a.exact {
+		n += left
+	}
+	for _, cycle := range a.cycles {
+		n += cycle.entry.Occurrences() - cycle.used
+	}
+	return n
 }
 
 // Grandfathered returns the still-live violations for shrinking a baseline.

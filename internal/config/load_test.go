@@ -178,3 +178,25 @@ boundaries:
 		}
 	}
 }
+
+func TestPolicyIDsAndReviewDatesAreValidated(t *testing.T) {
+	for _, declaration := range []string{
+		"components: [{id: 'bad|id', root: .}]",
+		"rules: [{id: 'bad|id', kind: invariant, summary: test}]",
+		"checks: [{id: 'bad|id', command: true}]",
+		"cross_repo_pins: [{id: 'bad|id', producer: p, artifact: a, consumer: c}]",
+		"rules: [{id: crutch, kind: crutch, summary: test, review_after: '2026-02-30'}]",
+	} {
+		t.Run(declaration, func(t *testing.T) {
+			if _, err := ParseBytes([]byte("schema_version: '1'\n"+declaration), "fixture"); err == nil {
+				t.Fatal("invalid policy accepted")
+			}
+		})
+	}
+	raw := []byte(`schema_version: '1'
+rules: [{id: date.ok-1, kind: crutch, summary: test, review_after: '2028-02-29'}]
+`)
+	if _, err := ParseBytes(raw, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/Farzin312/waypost/internal/compmap"
+	"github.com/Farzin312/waypost/internal/repoview"
 )
 
 type jsToken struct {
@@ -353,6 +354,8 @@ type tsPathMapping struct {
 }
 
 type tsConfigLoader struct {
+	view         *repoview.View
+	read         func(string, int) ([]byte, error)
 	repo         string
 	ignore       []string
 	allowedFiles map[string]bool
@@ -376,11 +379,12 @@ func (l tsConfigLoader) load(rel string, chain []string) (tsAliasConfig, error) 
 	if !validRepoPath(rel) || compmap.MatchAnyGlob(l.ignore, rel) || (l.allowedFiles != nil && !l.allowedFiles[rel]) {
 		return tsAliasConfig{}, fmt.Errorf("tsconfig extends references unavailable file %q", rel)
 	}
-	raw, err := compmap.ReadBoundedRegularFile(l.repo, filepath.Join(l.repo, rel), maxSourceFileBytes)
-	if err != nil {
-		return tsAliasConfig{}, err
+	read := l.read
+	if read == nil {
+		read = func(rel string, max int) ([]byte, error) {
+			return compmap.ReadBoundedRegularFile(l.repo, filepath.Join(l.repo, rel), max)
+		}
 	}
-
 	var doc struct {
 		Extends         json.RawMessage `json:"extends"`
 		CompilerOptions struct {
@@ -388,9 +392,19 @@ func (l tsConfigLoader) load(rel string, chain []string) (tsAliasConfig, error) 
 			Paths   map[string][]string `json:"paths"`
 		} `json:"compilerOptions"`
 	}
-	if err := json.Unmarshal(cleanJSONC(raw), &doc); err != nil {
-		return tsAliasConfig{}, err
+	if l.view == nil || !l.view.CachedParse(rel, "ts-alias-config", &doc) {
+		raw, err := read(rel, maxSourceFileBytes)
+		if err != nil {
+			return tsAliasConfig{}, err
+		}
+		if err := json.Unmarshal(cleanJSONC(raw), &doc); err != nil {
+			return tsAliasConfig{}, err
+		}
+		if l.view != nil {
+			l.view.CacheParse(rel, "ts-alias-config", doc)
+		}
 	}
+
 	var parents []string
 	if len(doc.Extends) > 0 {
 		var single string

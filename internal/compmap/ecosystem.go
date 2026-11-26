@@ -2,14 +2,18 @@ package compmap
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/Farzin312/waypost/internal/repopath"
+	"github.com/Farzin312/waypost/internal/repoview"
 	"gopkg.in/yaml.v3"
 )
 
@@ -81,6 +85,7 @@ type BoundsProject struct {
 	Enforce    string
 	Subsystems []BoundsSubsystem
 	Warnings   []string
+	Errors     []DiscoveryError
 }
 
 func insideRepo(absRepo, targetPath string) error {
@@ -168,6 +173,9 @@ func LoadBoundsProject(absRepo string, allowedFiles map[string]bool) (*BoundsPro
 }
 
 func LoadBoundsProjectForMigration(absRepo string) (*BoundsProject, error) {
+	if _, err := ReadBoundedRegularFile(absRepo, filepath.Join(absRepo, ".bounds/root.yaml"), MaxStaticDiscoveryBytes); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	return loadBoundsProject(absRepo, nil, ReadSameRepoRegularFile)
 }
 
@@ -179,14 +187,14 @@ func loadBoundsProject(absRepo string, allowedFiles map[string]bool, readManifes
 	}
 	const rootFile = ".bounds/root.yaml"
 	if allowedFiles == nil || allowedFiles[rootFile] {
-		raw, err := ReadBoundedRegularFile(absRepo, filepath.Join(absRepo, rootFile), MaxStaticDiscoveryBytes)
+		raw, err := readManifest(absRepo, filepath.Join(absRepo, rootFile), MaxStaticDiscoveryBytes)
 		switch {
 		case err == nil:
-			if err := yaml.Unmarshal(raw, &root); err != nil {
-				return nil, fmt.Errorf("%s: %w", rootFile, err)
+			if err := readBoundsYAML(raw, &root); err != nil {
+				return nil, DiscoveryError{rootFile, err}
 			}
 		case !errors.Is(err, os.ErrNotExist):
-			return nil, err
+			return nil, DiscoveryError{rootFile, err}
 		}
 	}
 	result.Enforce = root.Enforce
@@ -196,12 +204,25 @@ func loadBoundsProject(absRepo string, allowedFiles map[string]bool, readManifes
 	}
 
 	manifestsDir := filepath.Join(absRepo, ".bounds", "manifests")
-	if err := insideRepo(absRepo, manifestsDir); err != nil {
-		return nil, err
-	}
-	entries, err := os.ReadDir(manifestsDir)
-	if err != nil {
-		return nil, err
+	var entries []string
+	if allowedFiles != nil {
+		for rel := range allowedFiles {
+			if path.Dir(rel) == ".bounds/manifests" {
+				entries = append(entries, path.Base(rel))
+			}
+		}
+		sort.Strings(entries)
+	} else {
+		if err := insideRepo(absRepo, manifestsDir); err != nil {
+			return nil, err
+		}
+		files, err := os.ReadDir(manifestsDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			entries = append(entries, file.Name())
+		}
 	}
 	knownDirs := make(map[string]bool)
 	for f := range allowedFiles {
@@ -211,26 +232,26 @@ func loadBoundsProject(absRepo string, allowedFiles map[string]bool, readManifes
 	}
 	loaded := make(map[string]bool)
 	for _, e := range entries {
-		ext := filepath.Ext(e.Name())
+		ext := filepath.Ext(e)
 		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
-		stem := strings.TrimSuffix(e.Name(), ext)
+		stem := strings.TrimSuffix(e, ext)
 		if len(allowedSubsystems) > 0 && !allowedSubsystems[stem] {
 			continue
 		}
-		rel := ".bounds/manifests/" + e.Name()
+		rel := ".bounds/manifests/" + e
 		if allowedFiles != nil && !allowedFiles[rel] {
 			continue
 		}
-		raw, err := readManifest(absRepo, filepath.Join(manifestsDir, e.Name()), MaxStaticDiscoveryBytes)
+		raw, err := readManifest(absRepo, filepath.Join(manifestsDir, e), MaxStaticDiscoveryBytes)
 		if err != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
+			result.Errors = append(result.Errors, DiscoveryError{rel, err})
 			continue
 		}
 		var bm boundsManifestYAML
-		if err := yaml.Unmarshal(raw, &bm); err != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
+		if err := readBoundsYAML(raw, &bm); err != nil {
+			result.Errors = append(result.Errors, DiscoveryError{rel, err})
 			continue
 		}
 		id := nonEmptyStr(bm.Name, stem)
@@ -248,6 +269,10 @@ func loadBoundsProject(absRepo string, allowedFiles map[string]bool, readManifes
 		for _, p := range paths {
 			clean := strings.Trim(strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(p)), "./"), "/")
 			if clean == "" || clean == "." {
+				continue
+			}
+			if err := repopath.ValidateGlob(clean); err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
 				continue
 			}
 			prefix := clean
@@ -518,4 +543,51 @@ func nonEmptyStr(s, fallback string) string {
 		return fallback
 	}
 	return strings.TrimSpace(s)
+}
+
+func inspectViewEcosystem(v *repoview.View) EcosystemInfo {
+	info := EcosystemInfo{
+		HasAgentsMD: v.Files["AGENTS.md"].Regular(),
+		HasClaudeMD: v.Files["CLAUDE.md"].Regular(),
+		HasGitleaks: v.Files[".gitleaks.toml"].Regular(),
+	}
+	for _, m := range []struct{ file, name string }{{"pnpm-lock.yaml", "pnpm"}, {"yarn.lock", "yarn"}, {"bun.lock", "bun"}, {"bun.lockb", "bun"}, {"package-lock.json", "npm"}, {"package.json", "npm"}} {
+		if v.Files[m.file].Regular() {
+			info.PackageManager = m.name
+			break
+		}
+	}
+	for _, rel := range v.Paths() {
+		if strings.HasPrefix(rel, ".bounds/") {
+			info.HasBounds = true
+		}
+		if strings.HasPrefix(rel, ".github/workflows/") {
+			info.HasGitHubWorkflows = true
+		}
+		if !strings.HasPrefix(rel, ".agents/skills/") || strings.Count(rel, "/") != 3 || path.Base(rel) != "SKILL.md" {
+			continue
+		}
+		raw, err := v.Read(rel, MaxStaticDiscoveryBytes)
+		if err != nil {
+			continue
+		}
+		name, description := parseSkillFrontmatterBytes(raw)
+		folder := path.Base(path.Dir(rel))
+		info.DiscoveredSkills = append(info.DiscoveredSkills, DiscoveredSkill{Name: nonEmptyStr(name, folder), Path: rel, Description: description})
+		if v.Files[path.Join(".claude/skills", folder, "SKILL.md")].Regular() {
+			info.DuplicateSkillPaths = append(info.DuplicateSkillPaths, path.Join(".claude/skills", folder))
+		}
+	}
+	return info
+}
+
+func readBoundsYAML(raw []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	if dec.Decode(new(yaml.Node)) != io.EOF {
+		return errors.New("expected one YAML document")
+	}
+	return nil
 }

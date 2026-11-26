@@ -56,6 +56,18 @@ type Rule struct {
 	Kind        string `yaml:"kind" json:"kind"` // "invariant" | "crutch"
 	Summary     string `yaml:"summary" json:"summary"`
 	ReviewAfter string `yaml:"review_after,omitempty" json:"review_after,omitempty"`
+	Reason      string `yaml:"reason,omitempty" json:"reason,omitempty"`
+	VerifiedBy  *Proof `yaml:"verified_by,omitempty" json:"verified_by,omitempty"`
+}
+
+type Proof struct {
+	Checks []string `yaml:"checks,omitempty" json:"checks,omitempty"`
+	Tests  []string `yaml:"tests,omitempty" json:"tests,omitempty"`
+}
+
+type RuleOrigin struct {
+	Source    string `json:"source"`
+	Overrides string `json:"overrides,omitempty"`
 }
 
 // ComponentConfig declares a repository component, its dependencies, entrypoints,
@@ -75,13 +87,23 @@ type ComponentConfig struct {
 
 // CrossRepoPin documents an explicit dependency on an external repository contract.
 type CrossRepoPin struct {
-	ID                 string   `yaml:"id" json:"id"`
-	Producer           string   `yaml:"producer" json:"producer"`
-	Artifact           string   `yaml:"artifact" json:"artifact"`
-	Consumer           string   `yaml:"consumer" json:"consumer"`
-	Version            string   `yaml:"version,omitempty" json:"version,omitempty"`
-	CompatibilityCheck string   `yaml:"compatibility_check,omitempty" json:"compatibility_check,omitempty"`
-	Paths              []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+	ID                 string     `yaml:"id" json:"id"`
+	Producer           string     `yaml:"producer" json:"producer"`
+	Artifact           string     `yaml:"artifact" json:"artifact"`
+	Consumer           string     `yaml:"consumer" json:"consumer"`
+	Version            string     `yaml:"version,omitempty" json:"version,omitempty"`
+	CompatibilityCheck string     `yaml:"compatibility_check,omitempty" json:"compatibility_check,omitempty"`
+	Paths              []string   `yaml:"paths,omitempty" json:"paths,omitempty"`
+	Source             *PinSource `yaml:"source,omitempty" json:"source,omitempty"`
+	ContractID         string     `yaml:"contract_id,omitempty" json:"contract_id,omitempty"`
+	Role               string     `yaml:"role,omitempty" json:"role,omitempty"`
+	ConsumerComponent  string     `yaml:"consumer_component,omitempty" json:"consumer_component,omitempty"`
+}
+
+type PinSource struct {
+	Kind     string `yaml:"kind" json:"kind"`
+	Manifest string `yaml:"manifest" json:"manifest"`
+	Package  string `yaml:"package,omitempty" json:"package,omitempty"`
 }
 
 // Check defines a deterministic verification command bound to file globs or components.
@@ -96,7 +118,9 @@ type Check struct {
 	Description    string   `yaml:"description,omitempty" json:"description,omitempty"`
 	// RequiresBin optionally specifies an executable name that must exist in PATH.
 	// If missing on a required check, verify fails closed (FAIL, never PASS/SKIP).
-	RequiresBin string `yaml:"requires_bin,omitempty" json:"requires_bin,omitempty"`
+	RequiresBin  string `yaml:"requires_bin,omitempty" json:"requires_bin,omitempty"`
+	LocalCommand string `yaml:"local_command,omitempty" json:"local_command,omitempty"`
+	Serial       *bool  `yaml:"serial,omitempty" json:"serial,omitempty"`
 }
 
 // IsRequired reports whether the check is required (defaults to true).
@@ -137,13 +161,14 @@ type InheritanceStep struct {
 
 // ResolvedConfig holds the merged effective configuration alongside its provenance.
 type ResolvedConfig struct {
-	Effective            Config            `json:"effective"`
-	RootPath             string            `json:"root_path"`
-	Chain                []InheritanceStep `json:"chain"`
-	PolicyDigest         string            `json:"policy_digest"`
-	LocalOverrideApplied bool              `json:"local_override_applied"`
-	LocalOverrideIgnored bool              `json:"local_override_ignored"`
-	RawRootSHA256        string            `json:"raw_root_sha256"`
+	Effective            Config                `json:"effective"`
+	RootPath             string                `json:"root_path"`
+	Chain                []InheritanceStep     `json:"chain"`
+	PolicyDigest         string                `json:"policy_digest"`
+	LocalOverrideApplied bool                  `json:"local_override_applied"`
+	LocalOverrideIgnored bool                  `json:"local_override_ignored"`
+	RuleOrigins          map[string]RuleOrigin `json:"rule_origins,omitempty"`
+	RawRootSHA256        string                `json:"raw_root_sha256"`
 }
 
 // BoundariesConfig configures Waypost's built-in polyglot architecture boundary engine,
@@ -255,4 +280,27 @@ func (r *BoundaryRule) UnmarshalYAML(node *yaml.Node) error {
 	}
 	type plainRule BoundaryRule
 	return node.Decode((*plainRule)(r))
+}
+
+// UnmarshalYAML preserves the v1 Go and JSON representation while
+// distinguishing an omitted timeout from an explicitly invalid timeout.
+func (c *Check) UnmarshalYAML(node *yaml.Node) error {
+	var fields map[string]yaml.Node
+	if err := node.Decode(&fields); err != nil {
+		return err
+	}
+	for field, value := range fields {
+		switch field {
+		case "id", "command", "workdir", "paths", "components", "required", "description", "requires_bin", "local_command", "serial":
+		case "timeout_seconds":
+			var timeout int
+			if value.ShortTag() != "!!int" || value.Decode(&timeout) != nil || timeout < 1 || int64(timeout) > int64((1<<63-1)/1_000_000_000) {
+				return fmt.Errorf("line %d: timeout_seconds must be a positive representable integer", value.Line)
+			}
+		default:
+			return fmt.Errorf("line %d: unknown check field %q", value.Line, field)
+		}
+	}
+	type plainCheck Check
+	return node.Decode((*plainCheck)(c))
 }

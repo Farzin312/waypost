@@ -51,8 +51,8 @@ components:
 		},
 		{
 			name:           "strengthened-rule",
-			basePolicy:     strings.Replace(denyRule, "[api]", "[internal]", 1),
-			headPolicy:     strings.Replace(denyRule, "[api]", "[internal, api]", 1),
+			basePolicy:     strings.Replace(denyRule, "[api]", "[client]", 1),
+			headPolicy:     strings.Replace(denyRule, "[api]", "[client, api]", 1),
 			headComponents: baseComponents, wantRule: "client-no-api",
 		},
 		{
@@ -87,12 +87,17 @@ boundaries:
 			gitBoundaryFixture(t, dir, "commit", "-m", "base")
 			gitBoundaryFixture(t, dir, "checkout", "-b", "feature")
 
+			gitBoundaryFixture(t, dir, "commit", "--allow-empty", "-m", "unchanged policy")
 			opts := Options{Mode: "ci", Base: "main", Frozen: true, All: true}
 			if rec, err := Run(dir, opts); err != nil || rec.Summary.Outcome != StatusPass {
 				t.Fatalf("base fixture should pass: %+v, %v", rec, err)
 			}
 
-			writeBoundaryFixture(t, dir, config.ConfigFileName, boundaryHeader+tc.headPolicy+tc.headComponents)
+			headPolicy := boundaryHeader + "  ignore_paths: [src/client/known.ts]\n" + tc.headPolicy
+			if tc.wantTampering {
+				headPolicy = boundaryHeader + strings.Replace(tc.headPolicy, "[src/client/use.ts]", "[src/client/known.ts, src/client/use.ts]", 1)
+			}
+			writeBoundaryFixture(t, dir, config.ConfigFileName, headPolicy+tc.headComponents)
 			if tc.name == "new-rule-on-new-component" {
 				writeBoundaryFixture(t, dir, "src/client/nested/use.ts", "import '../../api/public';")
 			} else {
@@ -144,6 +149,12 @@ boundaries:
 	gitBoundaryFixture(t, dir, "add", ".")
 	gitBoundaryFixture(t, dir, "commit", "-m", "base")
 	gitBoundaryFixture(t, dir, "checkout", "-b", "feature")
+	raw, err := os.ReadFile(filepath.Join(dir, config.ConfigFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBoundaryFixture(t, dir, config.ConfigFileName, strings.ReplaceAll(string(raw), "from: consumer", "from: renamed"))
+	writeBoundaryLock(t, dir)
 	writeBoundaryFixture(t, dir, "consumer/package.json", `{"name":"renamed"}`)
 	writeBoundaryFixture(t, dir, "consumer/main.ts", "import '../library/public';")
 	gitBoundaryFixture(t, dir, "add", ".")
@@ -186,7 +197,8 @@ components:
 	writeBoundaryFixture(t, dir, "client/ignored.ts", "import '../api/public';")
 	writeBoundaryFixture(t, dir, "api/ignored.ts", "export const ignored = 1;")
 
-	rec, err := Run(dir, Options{Mode: "ci", Frozen: true, All: true})
+	gitBoundaryFixture(t, dir, "commit", "--allow-empty", "-m", "check ignored inputs")
+	rec, err := Run(dir, Options{Mode: "ci", Base: "HEAD^", Frozen: true, All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +252,7 @@ providers:
 			writeBoundaryFixture(t, dir, "api/public.ts", "export const pub = 1;")
 			writeBoundaryLock(t, dir)
 
-			rec, err := Run(dir, Options{Mode: "local", All: true, Frozen: true})
+			rec, err := Run(dir, Options{Mode: "local", All: true, Frozen: true, Providers: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -579,6 +591,11 @@ func TestCIRejectsUncommittedAndInvalidGitBaselines(t *testing.T) {
 					t.Skipf("symlinks unavailable: %v", err)
 				}
 			default:
+				if tc == "oversized base" {
+					if err := os.Remove(filepath.Join(dir, config.DefaultBaselinePath)); err != nil {
+						t.Fatal(err)
+					}
+				}
 				seedBoundaryFixture(t, dir, config.DefaultBaselinePath)
 			}
 			writeBoundaryLock(t, dir)
@@ -611,5 +628,73 @@ func seedBoundaryFixture(t *testing.T, dir, rel string) {
 	}
 	if err := archgraph.SaveBaseline(dir, rel, report.Violations); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCIAnalyzesHeadSourceWithTrustedAliasDefinitions(t *testing.T) {
+	dir := t.TempDir()
+	gitBoundaryFixture(t, dir, "init", "-b", "main")
+	writeBoundaryFixture(t, dir, config.ConfigFileName, `schema_version: "1"
+components:
+  - {id: web, root: web}
+  - {id: internal, root: internal}
+  - {id: public, root: public}
+boundaries:
+  enabled: true
+  rules:
+    - {id: web-no-internal, from: web, deny_depends_on: [internal]}
+`)
+	writeBoundaryFixture(t, dir, "tsconfig.paths.jsonc", `{"compilerOptions":{"paths":{"@lib/*":["./internal/*"]}}}`)
+	writeBoundaryFixture(t, dir, "tsconfig.json", `{"extends":"./tsconfig.paths.jsonc"}`)
+	writeBoundaryFixture(t, dir, "internal/lib.ts", "export const x = 1;")
+	writeBoundaryFixture(t, dir, "public/lib.ts", "export const x = 1;")
+	writeBoundaryFixture(t, dir, "web/app.ts", "export const app = 1;")
+	writeBoundaryLock(t, dir)
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "trusted alias")
+	gitBoundaryFixture(t, dir, "checkout", "-b", "candidate")
+	writeBoundaryFixture(t, dir, "tsconfig.paths.jsonc", `{"compilerOptions":{"paths":{"@lib/*":["./public/*"]}}}`)
+	writeBoundaryFixture(t, dir, "web/app.ts", "import '@lib/lib';")
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "change alias and import")
+	rec, err := Run(dir, Options{Mode: "ci", Base: "main", Frozen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := onlyBoundaryCheck(t, rec)
+	if got.Status != StatusFail || !strings.Contains(got.OutputExcerpt, "[web-no-internal]") {
+		t.Fatalf("base alias resolution was replaced with head metadata: %+v", got)
+	}
+}
+
+func TestCITrackedSourceInHeuristicallySkippedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	gitBoundaryFixture(t, dir, "init", "-b", "main")
+	writeBoundaryFixture(t, dir, config.ConfigFileName, `schema_version: '1'
+components: [{id: app, root: app}, {id: lib, root: lib}]
+boundaries:
+  enabled: true
+  no_cycles: true
+  enforce_declared_deps: true
+`)
+	writeBoundaryFixture(t, dir, "app/main.ts", "export {};")
+	writeBoundaryFixture(t, dir, "lib/public.ts", "export {};")
+	writeBoundaryFixture(t, dir, ".gitignore", "node_modules/\n")
+	writeBoundaryLock(t, dir)
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "base")
+	for _, name := range []string{"vendor", "build", ".internal", "coverage"} {
+		writeBoundaryFixture(t, dir, "app/"+name+"/new.ts", "import '../../lib/public';")
+	}
+	writeBoundaryFixture(t, dir, "app/node_modules/ignored.ts", "import '../../lib/public';")
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "track sources")
+	rec, err := Run(dir, Options{Mode: "ci", Base: "HEAD^", Frozen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := onlyBoundaryCheck(t, rec)
+	if check.Status != StatusFail || !strings.Contains(check.Reason, "4 boundary violation(s)") || strings.Contains(check.OutputExcerpt, "node_modules") {
+		t.Fatalf("tracked sources skipped or installed dependency scanned: %+v", check)
 	}
 }

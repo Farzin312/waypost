@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Farzin312/waypost/blob/main/schemas/history.v1.schema.json",
+  "title": "Waypost History v1",
+  "type": "object",
+  "properties": {
+    "history_version": {
+      "const": "1"
+    },
+    "ref_sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "traversal": {
+      "type": "string",
+      "enum": [
+        "first-parent",
+        "all-parents"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "next_cursor": {
+      "type": "string",
+      "minLength": 1
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sha": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "parents": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+            }
+          },
+          "comparisons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/comparison"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "sha",
+          "date",
+          "subject",
+          "parents",
+          "comparisons"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "history_version",
+    "ref_sha",
+    "traversal",
+    "complete",
+    "truncated",
+    "events",
+    "diagnostics"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "baseline": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cycle_members": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "cycle_edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "cycle_path": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "rule_id",
+        "from",
+        "fingerprint"
+      ],
+      "additionalProperties": false
+    },
+    "comparison": {
+      "type": "object",
+      "properties": {
+        "parent": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "ownership": {
+          "type": "string",
+          "enum": [
+            "resolved",
+            "unknown",
+            "inferred"
+          ]
+        },
+        "omitted_changes": { "type": "integer", "minimum": 0 },
+        "omitted_unmapped_paths": { "type": "integer", "minimum": 0 },
+        "omitted_policy_changes": { "type": "integer", "minimum": 0 },
+        "baseline_count": { "type": "integer", "minimum": 0 },
+        "omitted_baseline_occurrences": { "type": "integer", "minimum": 0 },
+        "cycle_edge_count": { "type": "integer", "minimum": 0 },
+        "omitted_cycle_edges": { "type": "integer", "minimum": 0 },
+        "component_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "old_path": {
+                "type": "string"
+              },
+              "old_owners": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "new_owners": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "status",
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "impact": {
+          "type": "object",
+          "properties": {
+            "changed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "direct_components": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "transitive_dependents": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "triggered_pins": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "unmapped_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "review_reasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "trust_path",
+                  "policy_floor",
+                  "contract_pin"
+                ]
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1,
+                "maxItems": 12
+              },
+              "omitted": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "code",
+              "items"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "policy_changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "rule",
+                  "component",
+                  "check",
+                  "pin",
+                  "boundary_policy",
+                  "boundary_rule"
+                ]
+              },
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "change": { "enum": ["added", "removed", "modified"] },
+              "fields": { "type": "array", "items": { "type": "string" } },
+              "before": {
+                "type": "object"
+              },
+              "after": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "baseline_occurrences": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entry": {
+                "$ref": "#/$defs/baseline"
+              },
+              "before": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "after": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "entry",
+              "before",
+              "after"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "cycle_edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "rule": {
+                "type": "string",
+                "minLength": 1
+              },
+              "edge": {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "to": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              "change": {
+                "type": "string",
+                "enum": [
+                  "added",
+                  "removed"
+                ]
+              }
+            },
+            "required": [
+              "rule",
+              "edge",
+              "change"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "complete",
+        "ownership",
+        "impact"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

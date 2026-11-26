@@ -1,0 +1,43 @@
+schema_version: "1"
+name: builtin-polyglot-native
+preset_version: "1.1.0"
+extends: "builtin:base@1.1.0"
+description: "Preset for polyglot native/engine repositories (Unreal C++/Python, Rust/C++, scientific pipelines) with explicit coverage-gap reporting."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - ".waypost.yaml"
+    - ".waypost.lock"
+    - ".github/workflows/**"
+    - "AGENTS.md"
+    - "**/*.uproject"
+    - "**/*.Build.cs"
+    - "CMakeLists.txt"
+rules:
+  - id: explicit-native-coverage-gaps
+    kind: invariant
+    summary: "Never pretend static inference covers native build targets, shaders, or binary assets; declare coverage gaps explicitly."
+  - id: validate-data-and-tools
+    kind: invariant
+    summary: "Data schema and tooling changes must pass deterministic validator checks before merge."
+  - id: engine-build-gate-awareness
+    kind: crutch
+    summary: "Check component trust_paths and host tool availability before attempting heavy native engine builds."
+    review_after: "2027-06-01"
+checks:
+  - id: python-validators
+    command: "python3 -m unittest discover -s tools"
+    paths: ["tools/**", "data/**"]
+    required: true
+    timeout_seconds: 180
+    description: "Deterministic Python validator and data integrity tests"
+skills:
+  - id: agents-md-standard
+    source: "https://agents.md"
+    version: "1.0"
+    kind: invariant
+    authorized: false
+    description: "AAIF AGENTS.md concise repo entry contract"
+providers: []

@@ -6,18 +6,9 @@
 
 ---
 
-## Why Waypost?
-
-Traditional per-repo "AI delivery systems" break down as projects scale:
-
-- **Copy-paste drift:** Vendoring 4,000+ lines of workflow scripts and markdown templates into every repo makes upgrades painful and inconsistent.
-- **Bookkeeping churn:** 20–40% of git commits become pure task/status/markdown bookkeeping instead of product engineering.
-- **Passive markdown failure:** Long `AGENTS.md` instructions decay under long context; only deterministic checks and CI policy floors actually hold.
-- **Blind agents:** Agents waste tokens grepping repositories without knowing *"what builds on what"*, which cross-repo contracts are pinned, which AAIF skills exist locally, or which files sit inside trust boundaries.
-
-`waypost` fixes all four with **6 focused commands** (`init`, `context`, `graph`, `verify`, `upgrade`, `version`), **1 config file (`.waypost.yaml`)**, **1 frozen lockfile (`.waypost.lock`)**, and **1 provenance-bound verification receipt (`receipt.v1.json`)**.
-
----
+Waypost keeps repository policy in `.waypost.yaml` and pins inherited inputs in
+`.waypost.lock`. Agents use the same component map and check scopes as verification.
+Git supplies the history, and local verification state lives in Git metadata.
 
 ## Architecture
 
@@ -56,11 +47,17 @@ CGO_ENABLED=0 go build -o waypost ./cmd/waypost
 
 ```bash
 waypost init
-# Optional: also create a 1-line CLAUDE.md -> @AGENTS.md pointer if absent
-waypost init --claude-md
+# Optional GitHub Actions workflow and CLAUDE.md pointer
+waypost init --ci --claude-md
 ```
 
-`waypost init` safely inspects your manifests, lockfiles (`pnpm`/`bun`/`yarn`/`npm`), real `package.json` scripts, `.bounds/manifests/`, and `.agents/skills/` without executing repo code. It selects a fitting preset (`base`, `app-ts`, or `polyglot-native`), writes `.waypost.yaml` and `.waypost.lock`, and inserts a compact pointer block into `AGENTS.md` (preserving your existing instructions).
+`waypost init` safely inspects your manifests, lockfiles (`pnpm`/`bun`/`yarn`/`npm`), real `package.json` scripts, `.bounds/manifests/`, and `.agents/skills/` without executing repo code. It selects an exact 1.1.0 preset (`base`, `app-ts`, or `polyglot-native`), writes `.waypost.yaml` and `.waypost.lock`, and inserts a compact pointer block into `AGENTS.md` (preserving your existing instructions).
+Starter checks use declared package scripts, Go and Cargo manifests, and Python
+test and Ruff configuration. A complete source scan seeds `enforce` when clean
+or `ratchet` with a tracked baseline when it finds existing violations.
+`--ci` generates a read-only workflow with detected branch filters and runtime
+setup. It installs the Waypost release, runs committed preflight before dependency
+installation, and preserves an existing workflow unless `--force` is supplied.
 
 ### Orient any AI agent ("what builds on what") & enforce architecture boundaries
 
@@ -68,6 +65,8 @@ waypost init --claude-md
 waypost context --changed
 waypost graph --changed --check-boundaries
 waypost graph --mermaid
+waypost spec --component api --history
+waypost history --trust-only --format markdown
 ```
 
 `waypost graph` replaces legacy external boundary tools (like `.bounds` + SQLite cache DBs + generated symbol manifests) with a **built-in, pure-Go polyglot static import engine** (TypeScript/JS with `tsconfig.json` `paths` & `baseUrl`, Go `go/parser` AST, Python, and Rust):
@@ -81,28 +80,47 @@ For an existing repository with boundary debt, enable `boundaries.enabled: true`
 `.waypost.baseline.json`, or set `boundaries.baseline` to a custom repository-relative path.
 CI fails on new violations and uses the base branch's baseline to reject PRs that expand it.
 Fingerprints survive line-number changes. Use `waypost sync --apply` after fixing old
-violations to shrink the baseline or switch to `enforce` when none remain.
+violations to shrink the baseline or switch to `enforce` after a complete clean
+scan. A smaller cycle can retain the allowance of a single old cycle if every
+member and directed edge is already covered.
 
-Reports:
-- **Components** with explicit provenance (`declared | inferred | tool-observed`), `depends_on`, reverse `depended_by` (*what builds on this component*), and cycle warnings
-- **Cross-repo pins** (`producer`, `artifact`, `consumer`, `compatibility_check`)
-- **Ecosystem & local AAIF skills** (`AGENTS.md`, `CLAUDE.md`, `.bounds`, `gitleaks`, `.agents/skills/*/SKILL.md`, and duplicate `.claude/skills/` warnings)
-- **Rules** classified as `invariant` (permanent) vs `crutch` (model-era guidance eligible for pruning)
-- **Honest gaps:** explicit `unmapped_paths` and `coverage_gaps`
+Changed context shows touched components, reverse impact, applicable invariants,
+selected checks, and recent commit subjects. Use `--recent 0` to omit history.
+Local verification records its outcome and exact worktree fingerprint in
+`$(git rev-parse --git-dir)/waypost/last-receipt-<prefixhash>.json`.
+Freshness includes the worktree, Git index, comparison base, and selected checks.
+Changed context also reports which production components lack touched tests.
+
+`spec` distinguishes executable entrypoints, public imports, declared dependencies,
+observed imports, and discovered tests. Add `reason` and `verified_by` to connect an
+invariant to checks and tracked test files. Use `--ref` to read a committed snapshot.
+`history` follows first parents by default. Use `--all-parents` for side branches,
+`--limit 0` for the full stream, or `--cursor` to continue a page. Both commands
+read static inputs and can emit text, Markdown, or JSON. History comparisons
+include bounded samples and omitted counts. `--component` scopes the comparison
+to that component. `spec --history` requires a positive limit.
 
 ### Keep the repository contract current
 
 ```bash
 waypost sync               # Preview drift
 waypost sync --check       # Fail on actionable drift
+waypost sync --check --offline --ref HEAD  # Inspect committed inputs in CI
 waypost sync --apply       # Apply safe updates and refresh the frozen lock
 ```
 
 Sync discovers unowned source directories, stale components, changed package pins,
 and missing check scripts. Apply preserves YAML comments and updates the contract
-and baseline where it can. Missing scripts and referenced stale components need
-a manual fix. Unwired scripts are advisory. `waypost context` includes a
-`sync_drift` section only when there is something to fix.
+and baseline in one recoverable publication. Broken proof links and unsafe
+baseline files block sync. Unwired scripts and expired `crutch` rules are
+advisory. Sync resolves workspace-qualified npm commands without running them. Review
+authorization changes with `waypost upgrade` and publish them explicitly with
+`waypost upgrade --apply`.
+
+`waypost pins` checks typed npm manifest sources and relevant lock or vendored
+artifact integrity offline. Compare explicitly supplied snapshots with
+`waypost pins --repo ../producer@main --repo .@HEAD`. A consumer that matches its
+declared release can report `behind` when a newer producer is available.
 
 ### Verify deterministically (local or CI)
 
@@ -111,24 +129,36 @@ a manual fix. Unwired scripts are advisory. `waypost context` includes a
 waypost verify
 
 # Authoritative CI gate with base-branch policy floor & SHA-256-verified frozen lockfile
-waypost verify --mode ci --frozen --base origin/main \
+waypost verify --mode ci --frozen --base "$EVENT_BASE_SHA" \
   --receipt .waypost/receipt.v1.json \
   --markdown .waypost/receipt.md
 
 # Air-gapped / pre-warmed cache CI (after restoring ~/.cache/waypost/presets)
-waypost verify --mode ci --frozen --offline --base origin/main
+waypost verify --mode ci --frozen --offline --base "$EVENT_BASE_SHA"
 ```
+
+CI requires a verified event base even with `--all`. Set it from the pull
+request base SHA or the push's previous SHA. The target tip supplies the policy
+floor and the merge base supplies change attribution. Verification runs both
+definitions when a required command changes. CI and escalated runs use
+`command`. Scoped local verification can use `local_command` with a private
+NUL-delimited `WAYPOST_CHANGED_FILES_FILE`. For production edits, explicit
+`node --test <files>` and `npm run <jest-script> -- --runTestsByPath <files>`
+commands with existing test paths are eligible for the local lane. Other
+selectors use the full command for production edits. A local selector can
+exit with `WAYPOST_NO_TESTS_EXIT_CODE` (5) to request full verification. The
+receipt records the final command and lane. Set `serial: false` on independent
+checks to allow concurrency and use `--jobs 1` to run serially.
 
 ### Inherit & upgrade shared presets across all repositories
 
-Supports built-in (`builtin:app-ts@1.0.0`), local relative paths (`../org-presets/v1.1.yaml`), and SHA-256-pinned remote presets (`github:owner/repo/presets/app-ts.yaml@v1.2.0` or `https://...`):
+Builtins have exact versions. Frozen floating references keep the versions
+recorded in their locks. CI and historical reads resolve file parents inside
+the selected repository snapshot.
 
 ```bash
-# Preview exact rule/check diffs & explicit permission-change warnings
-waypost upgrade --target github:Farzin312/waypost/internal/presets/app-ts.yaml@v0.1.0 --dry-run
-
-# Apply atomically & pin SHA-256 in .waypost.lock (git revert is always a clean rollback)
-waypost upgrade --target github:Farzin312/waypost/internal/presets/app-ts.yaml@v0.1.0 --apply
+waypost upgrade --to builtin:app-ts@1.1.0 --dry-run
+waypost upgrade --to builtin:app-ts@1.1.0 --apply
 ```
 
 Remote presets are cached content-addressed under `$WAYPOST_CACHE_DIR` (or `~/.cache/waypost/presets/<sha256>.yaml`), strictly verified against `.waypost.lock` in `--mode ci`, `--frozen`, or `--offline`, and prohibited from extending local filesystem paths.
@@ -137,7 +167,7 @@ Remote presets are cached content-addressed under `$WAYPOST_CACHE_DIR` (or `~/.c
 
 ## Key Guarantees
 
-- **Fail-Closed Policy Authority (`--mode ci`):** Enforces a **base-branch policy floor** (`git show <base>:.waypost.yaml` + `base:.waypost.lock`) so a PR cannot silently delete or weaken required checks or spoof remote preset pins. Evaluates **both sides of renames and deletions**, ignores `.waypost.local.yaml` in CI, and escalates unmapped paths or trust-boundary edits to the full repo gate.
+- **Fail-Closed Policy Authority (`--mode ci`):** Enforces policy from the verified target commit so a PR cannot silently delete or weaken required checks or spoof remote preset pins. Evaluates **both sides of renames and deletions**, ignores `.waypost.local.yaml` in CI, and escalates unmapped paths or trust-boundary edits to the full repo gate.
 - **Honest 4-State Verification:** Strict `PASS | FAIL | WARN | SKIP`. Unavailable required binaries (`requires_bin`) fail closed as `FAIL`, never `PASS` or `SKIP`. Check output is memory-bounded (64 KiB head+tail capture), preserves trailing failure traces, and scrubs common secrets before writing `receipt.v1.json`.
 - **Inheritable & Composable Without Vendoring:** Single-parent `extends` rejects cycles, duplicate IDs, and remote-to-local escapes. Native read-only ingestion for `.bounds/manifests/*.yaml` and `.agents/skills/*/SKILL.md` works out of the box, while active external providers remain behind an explicit `authorized: true` gate pinned in `.waypost.lock`.
 - **Built to Grow With Newer AI:** Rules and skills distinguish `kind: invariant` from `kind: crutch` so model-era scaffolding can be pruned cleanly across repositories as frontier models improve.
@@ -147,20 +177,22 @@ Remote presets are cached content-addressed under `$WAYPOST_CACHE_DIR` (or `~/.c
 
 ## GitHub Action
 
-Use the included composite action in `.github/workflows/ci.yml`:
+Pin `Farzin312/waypost/action` to the full release commit SHA. Use a full
+checkout with persisted credentials disabled. The composite Action builds
+its own source using the Go version pinned in `go.mod` and runs offline sync
+before verification. It derives the base from the GitHub event and publishes
+the receipt path and failing stage under the runner's temporary directory.
+Use `allow-bootstrap: "true"` for an explicitly authorized first adoption
+whose target has no Waypost policy. An explicit base alias on a PR or push
+must resolve to the event SHA. The verifier toolchain is selected for the
+Action build without changing the caller's PATH.
 
-```yaml
-- uses: actions/checkout@v4
-  with:
-    fetch-depth: 0
-- uses: Farzin312/waypost/action@main
-  with:
-    frozen: "true"
-    sync-check: "true" # Optional drift gate
-```
-
-The action defaults to `waypost-ref: v0.2.0` and verifies prebuilt release binaries
-against `SHA256SUMS.txt`. Branch refs and unavailable release binaries use `go install`.
+When changing required checks on adoption or upgrade, provision dependencies
+and services for both the old and new commands in the same workflow change.
+Run committed preflight before installs that execute lifecycle scripts.
+Provision any database services and subproject dependencies used by new
+required checks. Run installs such as `npm ci` after committed preflight so
+lifecycle scripts such as `prepare` run after policy validation.
 
 ---
 
@@ -170,7 +202,7 @@ against `SHA256SUMS.txt`. Branch refs and unavailable release binaries use `go i
 - [Component Map & Real-World Examples](docs/COMPONENT_MAP.md)
 - [Growing With Newer AI (`invariant` vs `crutch`)](docs/EVOLUTION.md)
 - [Packaging External Tools & Skills](docs/PACKAGING.md)
-- JSON Schemas: [waypost.v1](schemas/waypost.v1.schema.json) · [lock.v1](schemas/lock.v1.schema.json) · [receipt.v1](schemas/receipt.v1.schema.json)
+- JSON Schemas: [waypost.v1](schemas/waypost.v1.schema.json) · [lock.v1](schemas/lock.v1.schema.json) · [receipt.v1](schemas/receipt.v1.schema.json) · [spec.v1](schemas/spec.v1.schema.json) · [history.v1](schemas/history.v1.schema.json) · [pins.v1](schemas/pins.v1.schema.json)
 - Worked Examples: [TypeScript Mobile App](examples/app-ts/.waypost.yaml) · [Unreal C++ / Python Polyglot](examples/polyglot-native/.waypost.yaml)
 
 ## License

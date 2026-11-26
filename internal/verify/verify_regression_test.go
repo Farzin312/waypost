@@ -2,6 +2,7 @@ package verify
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,7 +35,7 @@ providers:
 		t.Fatal(err)
 	}
 	// Intentionally DO NOT write a valid .waypost.lock!
-	rec, err := Run(dir, Options{Mode: "local", Frozen: true})
+	rec, err := Run(dir, Options{Mode: "local", Frozen: true, Providers: true})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
@@ -116,5 +117,68 @@ checks: []
 	}
 	if !strings.Contains(string(rawJSON), `"checks":[]`) {
 		t.Fatalf("expected empty JSON array for checks, got: %s", string(rawJSON))
+	}
+}
+
+func TestCIRequiresEventBaseAndRunsBothCheckDefinitions(t *testing.T) {
+	dir := t.TempDir()
+	gitBoundaryFixture(t, dir, "init", "-b", "main")
+	cfg := func(command string) string {
+		return fmt.Sprintf(`schema_version: "1"
+checks:
+  - id: obligated
+    command: "echo %s"
+    local_command: "echo local"
+`, command)
+	}
+	writeBoundaryFixture(t, dir, config.ConfigFileName, cfg("base"))
+	writeBoundaryLock(t, dir)
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "base")
+	gitBoundaryFixture(t, dir, "checkout", "-b", "head")
+	writeBoundaryFixture(t, dir, config.ConfigFileName, cfg("head"))
+	writeBoundaryLock(t, dir)
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "head")
+
+	t.Setenv("WAYPOST_CI_BASE", "")
+	for _, base := range []string{"", strings.Repeat("0", 40), "missing"} {
+		rec, err := Run(dir, Options{Mode: "ci", Base: base, All: true, Frozen: true})
+		if err != nil || rec.Summary.Outcome != StatusFail || rec.Summary.Passed != 0 || rec.PlanComplete {
+			t.Fatalf("invalid CI authority %q: %+v %v", base, rec, err)
+		}
+	}
+	rec, err := Run(dir, Options{Mode: "ci", Base: "main", All: true, Frozen: true})
+	if err != nil || rec.Summary.Outcome != StatusPass || len(rec.Checks) != 2 || !rec.PlanComplete ||
+		rec.Checks[0].DefinitionSource != "base" || rec.Checks[0].OutputExcerpt != "base" ||
+		rec.Checks[1].DefinitionSource != "head" || rec.Checks[1].OutputExcerpt != "head" ||
+		rec.Checks[0].Lane != "full" || rec.Checks[1].Lane != "full" ||
+		rec.Digests.TargetPolicyDigest == rec.Digests.HeadPolicyDigest || rec.Verifier.BinarySHA256 == "" {
+		t.Fatalf("CI obligations were not proved: %+v %v", rec, err)
+	}
+	gitBoundaryFixture(t, dir, "update-index", "--assume-unchanged", config.ConfigFileName)
+	rec, err = Run(dir, Options{Mode: "ci", Base: "main", All: true})
+	if err != nil || rec.Summary.Outcome != StatusFail || !strings.Contains(strings.Join(rec.Policy.PreflightFailures, " "), "hides worktree changes") {
+		t.Fatalf("unsafe Git index passed preflight: %+v %v", rec, err)
+	}
+}
+
+func TestCIBootstrapRequiresCleanFirstAdoption(t *testing.T) {
+	dir := t.TempDir()
+	gitBoundaryFixture(t, dir, "init", "-b", "main")
+	gitBoundaryFixture(t, dir, "commit", "--allow-empty", "-m", "pre-adoption")
+	writeBoundaryFixture(t, dir, config.ConfigFileName, "schema_version: '1'\nchecks: [{id: proof, command: echo adopted}]\n")
+	writeBoundaryLock(t, dir)
+	gitBoundaryFixture(t, dir, "add", ".")
+	gitBoundaryFixture(t, dir, "commit", "-m", "adopt")
+	opts := Options{Mode: "ci", Base: strings.Repeat("0", 40), AllowBootstrap: true, Frozen: true}
+	rec, err := Run(dir, opts)
+	if err != nil || rec.Summary.Outcome != StatusPass || !rec.PlanComplete {
+		t.Fatalf("first adoption failed %+v %v", rec, err)
+	}
+	gitBoundaryFixture(t, dir, "commit", "--allow-empty", "-m", "already adopted")
+	rec, err = Run(dir, opts)
+	if err != nil || rec.Summary.Outcome != StatusFail || rec.Summary.Passed != 0 {
+		t.Fatalf("established policy bootstrap passed %+v %v", rec, err)
 	}
 }

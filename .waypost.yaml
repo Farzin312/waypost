@@ -1,7 +1,7 @@
 # Waypost v1 repository contract — dogfooding waypost (including native architecture boundaries) on itself.
 schema_version: "1"
 name: waypost
-extends: "builtin:base@1.0.0"
+extends: "builtin:base@1.1.0"
 description: "Agent-first repository orientation, native architecture boundaries, inheritable policy, and deterministic verification CLI."
 policy:
   fail_closed_on_unmapped: true
@@ -44,6 +44,21 @@ boundaries:
       from: config
       deny_depends_on: ["cli", "verify", "policy", "upgrade", "archgraph"]
       reason: "internal/config cannot depend on higher orchestration packages"
+rules:
+  - id: preflight-before-execution
+    kind: invariant
+    summary: "Validate the trusted base, frozen lock, and static inputs before executing repository checks."
+    reason: "An invalid checkout cannot issue a trusted receipt or run repository commands during preflight."
+    verified_by:
+      checks: [go-test-race]
+      tests: [internal/verify/verify_regression_test.go, internal/verify/boundaries_test.go]
+  - id: legacy-lock-readable
+    kind: invariant
+    summary: "Binaries that support schema v1 continue to verify the original frozen polyglot fixture."
+    reason: "Builtin preset releases can coexist without rewriting installed locks."
+    verified_by:
+      checks: [go-test-race]
+      tests: [internal/cli/schema_conformance_test.go, internal/cli/sync_test.go]
 components:
   - id: cli-entrypoint
     root: cmd/waypost
@@ -57,21 +72,21 @@ components:
     root: internal/cli
     kind: package
     language: go
-    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "presets", "syncer", "upgrade", "verify", "version"]
+    depends_on: ["archgraph", "changeplan", "compmap", "config", "gitdiff", "history", "lockfile", "pins", "presets", "project", "repopath", "repoview", "spec", "syncer", "upgrade", "verify", "version", "workstate", "repowrite"]
     paths: ["internal/cli/**"]
     checks: ["go-vet", "go-test-race"]
   - id: archgraph
     root: internal/archgraph
     kind: package
     language: go
-    depends_on: ["compmap", "config"]
+    depends_on: ["compmap", "config", "repopath", "repoview", "repowrite"]
     paths: ["internal/archgraph/**"]
     checks: ["go-vet", "go-test-race"]
   - id: config
     root: internal/config
     kind: package
     language: go
-    depends_on: ["presets", "remote", "version"]
+    depends_on: ["presets", "remote", "repopath", "version"]
     paths: ["internal/config/**"]
     checks: ["go-vet", "go-test-race"]
   - id: presets
@@ -96,7 +111,7 @@ components:
     root: internal/lockfile
     kind: package
     language: go
-    depends_on: ["config", "remote", "version"]
+    depends_on: ["config", "remote", "repopath", "version", "repowrite"]
     paths: ["internal/lockfile/**"]
     checks: ["go-vet", "go-test-race"]
   - id: gitdiff
@@ -109,28 +124,28 @@ components:
     root: internal/compmap
     kind: package
     language: go
-    depends_on: ["config", "shellcmd"]
+    depends_on: ["config", "repopath", "repoview", "shellcmd"]
     paths: ["internal/compmap/**"]
     checks: ["go-vet", "go-test-race"]
   - id: policy
     root: internal/policy
     kind: package
     language: go
-    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile"]
+    depends_on: ["archgraph", "config", "project"]
     paths: ["internal/policy/**"]
     checks: ["go-vet", "go-test-race"]
   - id: verify
     root: internal/verify
     kind: package
     language: go
-    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "policy", "shellcmd", "version"]
+    depends_on: ["archgraph", "changeplan", "compmap", "config", "gitdiff", "lockfile", "policy", "project", "repoview", "shellcmd", "version", "workstate"]
     paths: ["internal/verify/**"]
     checks: ["go-vet", "go-test-race"]
   - id: upgrade
     root: internal/upgrade
     kind: package
     language: go
-    depends_on: ["config", "lockfile"]
+    depends_on: ["config", "lockfile", "repopath", "repowrite"]
     paths: ["internal/upgrade/**"]
     checks: ["go-vet", "go-test-race"]
   - id: version
@@ -159,12 +174,70 @@ components:
   - id: syncer
     root: internal/syncer
     language: go
-    depends_on:
-      - archgraph
-      - compmap
-      - config
-      - lockfile
-      - upgrade
+    depends_on: ["archgraph", "compmap", "config", "lockfile", "pins", "project", "repopath", "repoview", "repowrite"]
+    checks: ["go-vet", "go-test-race"]
+  - id: changeplan
+    root: internal/changeplan
+    kind: package
+    language: go
+    depends_on: ["compmap", "config", "gitdiff"]
+    paths: ["internal/changeplan/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: history
+    root: internal/history
+    kind: package
+    language: go
+    depends_on: ["archgraph", "changeplan", "compmap", "config", "gitdiff", "project", "repoview"]
+    paths: ["internal/history/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: pins
+    root: internal/pins
+    kind: package
+    language: go
+    depends_on: ["config", "repopath", "repoview"]
+    paths: ["internal/pins/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: project
+    root: internal/project
+    kind: package
+    language: go
+    depends_on: ["archgraph", "compmap", "config", "lockfile", "pins", "repopath", "repoview"]
+    paths: ["internal/project/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: repopath
+    root: internal/repopath
+    kind: package
+    language: go
+    paths: ["internal/repopath/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: repoview
+    root: internal/repoview
+    kind: package
+    language: go
+    depends_on: ["gitdiff", "repopath"]
+    paths: ["internal/repoview/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: spec
+    root: internal/spec
+    kind: package
+    language: go
+    depends_on: ["archgraph", "changeplan", "compmap", "config", "gitdiff", "history", "pins", "project", "repoview", "verify"]
+    paths: ["internal/spec/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: workstate
+    root: internal/workstate
+    kind: package
+    language: go
+    depends_on: ["gitdiff", "repopath", "repoview"]
+    paths: ["internal/workstate/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: repowrite
+    root: internal/repowrite
+    kind: package
+    language: go
+    depends_on: ["repopath", "repoview"]
+    paths: ["internal/repowrite/**"]
+    checks: ["go-vet", "go-test-race"]
 checks:
   - id: go-vet
     command: "go vet ./..."
@@ -179,9 +252,9 @@ checks:
     timeout_seconds: 180
     description: "Full Go test suite with race detector"
   - id: validate-schemas
-    command: "python3 -c 'import glob,json; [json.load(open(f)) for f in glob.glob(\"schemas/*.json\")]'"
-    paths: ["schemas/**"]
+    command: "go test ./internal/cli -run 'SchemaConformance' -count=1"
+    paths: ["schemas/**", "internal/cli/schema_conformance_test.go"]
     required: true
-    requires_bin: "python3"
-    timeout_seconds: 30
-    description: "Validate JSON syntax of all v1 schemas"
+    requires_bin: "go"
+    timeout_seconds: 60
+    description: "Validate v1 schemas against CLI output and compatibility fixtures"

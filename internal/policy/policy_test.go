@@ -4,11 +4,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/gitdiff"
+	"github.com/Farzin312/waypost/internal/project"
+	"github.com/Farzin312/waypost/internal/repoview"
 )
 
 func runGit(t *testing.T, dir string, args ...string) {
@@ -120,38 +124,35 @@ checks:
 	runGit(t, dir, "commit", "-m", "add new-main-tip-gate on main")
 	runGit(t, dir, "checkout", "pr/tamper")
 
-	resolved, err := config.Load(dir, config.LoadOptions{Mode: "ci"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	snap, err := gitdiff.Inspect(dir, "main", "ci")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bf := LoadBaseFloor(dir, "ci", resolved, snap, false)
-	if !bf.Enforced || !bf.RequireFrozenLockInCI || !bf.FailClosedOnUnmapped {
-		t.Fatalf("expected trusted base controls enforced, got %+v", bf)
+	if snap.TargetSHA == snap.BaseSHA {
+		t.Fatal("fixture target must be ahead of the merge base")
 	}
-	cm, err := compmap.Build(dir, &resolved.Effective, nil)
-	if err != nil {
-		t.Fatal(err)
+	store := repoview.NewStore(dir)
+	defer store.Close()
+	read := func(sha string) *project.Snapshot {
+		t.Helper()
+		view, err := store.Tree(sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := project.Load(view, config.LoadOptions{Offline: true}, compmap.BuildOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	plan, err := Plan(dir, "ci", resolved, bf, cm, snap, false)
-	if err != nil {
-		t.Fatal(err)
+	target, head := read(snap.TargetSHA), read(snap.HeadSHA)
+	findings, blocking, _ := CompareFloor(target, head, read(snap.BaseSHA))
+	for _, id := range []string{"ancestor-gate", "enforce_base_floor_in_ci", "fail_closed_on_unmapped", "require_frozen_lock_in_ci"} {
+		if !slices.ContainsFunc(blocking, func(s string) bool { return strings.Contains(s, id) }) {
+			t.Fatalf("missing %s in %v", id, blocking)
+		}
 	}
-
-	checksByID := make(map[string]SelectedCheck)
-	for _, sc := range plan.Checks {
-		checksByID[sc.Check.ID] = sc
-	}
-	if sc, ok := checksByID["security-gate"]; !ok || sc.Check.Command != "echo trusted-security" || !sc.FromBase {
-		t.Fatalf("expected trusted security-gate command enforced, got %+v", sc)
-	}
-	if sc, ok := checksByID["ancestor-gate"]; !ok || sc.Check.Command != "echo trusted-ancestor" || !sc.FromBase {
-		t.Fatalf("expected ancestor-gate restored from git base commit, got %+v", sc)
-	}
-	if sc, ok := checksByID["new-main-tip-gate"]; !ok || !sc.FromBase {
-		t.Fatalf("expected new-main-tip-gate from main tip after fork, got %+v", sc)
+	if !slices.ContainsFunc(findings, func(s string) bool { return strings.Contains(s, "security-gate") }) {
+		t.Fatalf("missing changed definition in %v", findings)
 	}
 }

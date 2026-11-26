@@ -1,190 +1,211 @@
-name: "Waypost Verify"
-description: "Run fail-closed Waypost CI verification with base-branch policy floor, frozen lockfile validation, and receipt.v1.json output."
+name: Waypost Verify
+description: Verify frozen Waypost policy against the GitHub event base.
 inputs:
   base:
-    description: "Base git ref for diff and policy floor evaluation (defaults to PR base ref or origin/main)."
+    description: Optional base alias. On PR and push events it must resolve to the recorded event SHA.
     required: false
     default: ""
   frozen:
-    description: "Require committed .waypost.lock to match exactly."
-    required: false
+    description: Require the committed lock to match the resolved policy.
     default: "true"
   all:
-    description: "Force full repository verification regardless of diff scoping."
-    required: false
+    description: Run all repository checks.
+    default: "false"
+  allow-bootstrap:
+    description: Authorize a first-adoption commit whose target has no Waypost policy.
     default: "false"
   receipt-path:
-    description: "Output path for receipt.v1.json."
-    required: false
-    default: ".waypost/receipt.v1.json"
+    description: Receipt filename. Only the basename is used inside RUNNER_TEMP.
+    default: receipt.v1.json
   markdown-path:
-    description: "Output path for PR Markdown summary."
-    required: false
-    default: ".waypost/receipt.md"
-  go-version:
-    description: "Go version to install when waypost is not pre-installed."
-    required: false
-    default: "1.26"
-  waypost-ref:
-    description: "Release tag or Git ref of github.com/Farzin312/waypost to install."
-    required: false
-    default: "v0.2.0"
+    description: Summary filename. Only the basename is used inside RUNNER_TEMP.
+    default: receipt.md
   sync-check:
-    description: "Fail if waypost sync detects actionable drift."
+    description: Run mandatory offline sync preflight. Retained for existing callers.
+    default: "true"
+  waypost-ref:
+    description: Deprecated input. The verifier is built from this Action's pinned source.
     required: false
-    default: "false"
+  go-version:
+    description: Deprecated input. The toolchain version comes from this Action's go.mod.
+    required: false
 outputs:
   outcome:
-    description: "Verification summary outcome (PASS, WARN, or FAIL)."
-    value: ${{ steps.run.outputs.outcome }}
+    description: Verification outcome.
+    value: ${{ steps.report.outputs.outcome }}
+  stage:
+    description: The final stage reached by the verification gate.
+    value: ${{ steps.report.outputs.stage }}
   receipt-path:
-    description: "Path to generated receipt.v1.json."
-    value: ${{ inputs.receipt-path }}
-
+    description: Absolute path to the verification receipt.
+    value: ${{ steps.gate.outputs.receipt_path }}
 runs:
-  using: "composite"
+  using: composite
   steps:
-    - name: Check pre-installed waypost
-      id: check_bin
-      shell: bash
-      run: |
-        if command -v waypost >/dev/null 2>&1; then
-          echo "found=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "found=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Download and verify Waypost release
-      id: download
-      if: steps.check_bin.outputs.found != 'true'
+    - name: Resolve isolated verifier Go toolchain
+      id: setup
       shell: bash
       env:
-        WAYPOST_REF: ${{ inputs.waypost-ref }}
+        ACTION_PATH: ${{ github.action_path }}
+        GOWORK: "off"
+        GOENV: "off"
+        GOFLAGS: ""
       run: |
-        if [[ ! "$WAYPOST_REF" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]]; then
-          exit 0
-        fi
+        set -euo pipefail
+        VERSION="$(awk '$1 == "go" { print $2; exit }' "$ACTION_PATH/../go.mod")"
+        [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        unset GOROOT
+        [[ "$(GOTOOLCHAIN="go$VERSION" go env GOVERSION)" == "go$VERSION" ]]
+        printf 'toolchain=go%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Build verifier from Action source
+      id: verifier
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ACTION_REF: ${{ github.action_ref }}
+        CGO_ENABLED: "0"
+        GOWORK: "off"
+        GOENV: "off"
+        GOFLAGS: ""
+        GOTOOLCHAIN: ${{ steps.setup.outputs.toolchain }}
+      run: |
+        set -euo pipefail
+        trap 'echo "::error title=Waypost build::Could not build the pinned verifier"' ERR
+        unset GOROOT
+        SOURCE_DIR="$(cd "$ACTION_PATH/.." && pwd -P)"
         TEMP_DIR="$RUNNER_TEMP"
         EXT=""
-        case "$RUNNER_OS" in
-          Linux) OS=linux ;;
-          macOS) OS=darwin ;;
-          Windows) OS=windows; EXT=".exe"; TEMP_DIR="$(cygpath -u "$TEMP_DIR")" ;;
-          *) exit 0 ;;
-        esac
-        case "$RUNNER_ARCH" in
-          X64) ARCH=amd64 ;;
-          ARM64) ARCH=arm64 ;;
-          *) exit 0 ;;
-        esac
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          TEMP_DIR="$(cygpath -u "$TEMP_DIR")"
+          EXT=".exe"
+        fi
+        OUTPUT_DIR="$(mktemp -d "$TEMP_DIR/waypost.XXXXXX")"
+        BIN="$OUTPUT_DIR/waypost$EXT"
+        BUILD_ARGS=(-mod=readonly -trimpath)
+        if [[ "$ACTION_REF" =~ ^[a-f0-9]{40}$ ]]; then
+          BUILD_ARGS+=(-ldflags "-X github.com/Farzin312/waypost/internal/version.Commit=$ACTION_REF")
+        fi
+        go -C "$SOURCE_DIR" build "${BUILD_ARGS[@]}" -o "$BIN" ./cmd/waypost
+        printf 'bin=%s\noutput_dir=%s\n' "$BIN" "$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
-        ASSET="waypost-${OS}-${ARCH}${EXT}"
-        RELEASE="https://github.com/Farzin312/waypost/releases/download/$WAYPOST_REF"
-        INSTALL_DIR="$(mktemp -d "$TEMP_DIR/waypost.XXXXXX")"
-        if ! curl --fail --silent --show-error --location --proto '=https' --max-time 30 \
-          --output "$INSTALL_DIR/$ASSET" "$RELEASE/$ASSET"; then
-          echo "Release binary unavailable. Falling back to go install."
-          exit 0
-        fi
-        if ! curl --fail --silent --show-error --location --proto '=https' --max-time 30 \
-          --output "$INSTALL_DIR/SHA256SUMS.txt" "$RELEASE/SHA256SUMS.txt"; then
-          echo "Release checksums unavailable. Falling back to go install."
-          exit 0
-        fi
-        EXPECTED="$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1 }' "$INSTALL_DIR/SHA256SUMS.txt")"
-        if [[ ! "$EXPECTED" =~ ^[[:xdigit:]]{64}$ ]]; then
-          echo "::error::Missing or ambiguous SHA-256 checksum for $ASSET"
-          exit 1
-        fi
-        (
-          cd "$INSTALL_DIR"
-          if command -v sha256sum >/dev/null 2>&1; then
-            printf '%s  %s\n' "$EXPECTED" "$ASSET" | sha256sum --check -
-          else
-            printf '%s  %s\n' "$EXPECTED" "$ASSET" | shasum -a 256 --check -
-          fi
-        )
-        mv "$INSTALL_DIR/$ASSET" "$INSTALL_DIR/waypost$EXT"
-        chmod +x "$INSTALL_DIR/waypost$EXT"
-        if [ "$RUNNER_OS" = "Windows" ]; then
-          INSTALL_DIR="$(cygpath -w "$INSTALL_DIR")"
-        fi
-        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-        echo "found=true" >> "$GITHUB_OUTPUT"
-
-    - name: Set up Go
-      if: steps.check_bin.outputs.found != 'true' && steps.download.outputs.found != 'true'
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-      with:
-        go-version: ${{ inputs.go-version }}
-
-    - name: Install waypost binary
-      if: steps.check_bin.outputs.found != 'true' && steps.download.outputs.found != 'true'
+    - name: Check policy and verify
+      id: gate
       shell: bash
       env:
-        WAYPOST_REF: ${{ inputs.waypost-ref }}
-      run: |
-        echo "Installing github.com/Farzin312/waypost/cmd/waypost@${WAYPOST_REF}"
-        go install "github.com/Farzin312/waypost/cmd/waypost@${WAYPOST_REF}"
-        INSTALL_BIN="$(go env GOBIN)"
-        if [ -z "$INSTALL_BIN" ]; then
-          INSTALL_BIN="$(go env GOPATH)/bin"
-        fi
-        echo "$INSTALL_BIN" >> "$GITHUB_PATH"
-
-    - name: Run waypost verify (CI authority)
-      id: run
-      shell: bash
-      env:
+        BIN: ${{ steps.verifier.outputs.bin }}
+        OUTPUT_DIR: ${{ steps.verifier.outputs.output_dir }}
         INPUT_BASE: ${{ inputs.base }}
-        INPUT_FROZEN: ${{ inputs.frozen }}
         INPUT_ALL: ${{ inputs.all }}
-        INPUT_RECEIPT_PATH: ${{ inputs.receipt-path }}
-        INPUT_MARKDOWN_PATH: ${{ inputs.markdown-path }}
+        INPUT_FROZEN: ${{ inputs.frozen }}
+        INPUT_BOOTSTRAP: ${{ inputs.allow-bootstrap }}
+        INPUT_SYNC_CHECK: ${{ inputs.sync-check }}
+        RECEIPT_NAME: ${{ inputs.receipt-path }}
+        MARKDOWN_NAME: ${{ inputs.markdown-path }}
+        EVENT_KIND: ${{ github.event_name }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PUSH_BASE: ${{ github.event.before }}
       run: |
-        # Remove any stale receipt/markdown from earlier steps so outcome always reflects this run.
-        rm -f "$INPUT_RECEIPT_PATH" "$INPUT_MARKDOWN_PATH"
-
-        BASE_REF="$INPUT_BASE"
-        if [ -z "$BASE_REF" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
-          BASE_REF="origin/${GITHUB_BASE_REF}"
+        set -euo pipefail
+        STAGE=preflight
+        trap 'printf "stage=%s\noutcome=FAIL\n" "$STAGE" >> "$GITHUB_OUTPUT"; echo "::error title=Waypost $STAGE::Verification gate failed"' ERR
+        if [[ "$INPUT_SYNC_CHECK" != true ]]; then
+          echo "sync-check must be true because Waypost preflight is mandatory" >&2
+          false
         fi
-
-        ARGS=(verify --mode ci --receipt "$INPUT_RECEIPT_PATH" --markdown "$INPUT_MARKDOWN_PATH")
-        if [ -n "$BASE_REF" ]; then
-          ARGS+=(--base "$BASE_REF")
+        case "$EVENT_KIND" in
+          pull_request|pull_request_target) BASE="$PR_BASE" ;;
+          push) BASE="$PUSH_BASE" ;;
+          *) BASE="$INPUT_BASE" ;;
+        esac
+        HEAD="$(git rev-parse --verify HEAD^{commit})"
+        ARGS=(verify --mode ci --offline)
+        if [[ "$INPUT_FROZEN" == true ]]; then ARGS+=(--frozen); fi
+        if [[ "$INPUT_ALL" == true ]]; then ARGS+=(--all); fi
+        if [[ "$INPUT_BOOTSTRAP" == true ]]; then ARGS+=(--allow-bootstrap); fi
+        if [[ -n "$BASE" && ! "$BASE" =~ ^(0{40}|0{64})$ ]]; then
+          case "$EVENT_KIND" in
+            pull_request|pull_request_target|push) [[ "$BASE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ;;
+          esac
+          BASE="$(git rev-parse --verify --end-of-options "$BASE^{commit}")"
+          [[ "$BASE" != "$HEAD" ]]
+        elif [[ "$INPUT_BOOTSTRAP" != true ]]; then
+          echo "Missing or zero GitHub event base" >&2
+          false
         fi
-        if [ "$INPUT_FROZEN" = "true" ]; then
-          ARGS+=(--frozen)
+        if [[ -n "$INPUT_BASE" ]]; then
+          if [[ ! "$INPUT_BASE" =~ ^(0{40}|0{64})$ ]]; then
+            INPUT_BASE="$(git rev-parse --verify --end-of-options "$INPUT_BASE^{commit}")"
+          fi
+          if [[ "$INPUT_BASE" != "$BASE" ]]; then
+            echo "The supplied base does not match the GitHub event SHA" >&2
+            false
+          fi
         fi
-        if [ "$INPUT_ALL" = "true" ]; then
-          ARGS+=(--all)
+        if [[ -n "$BASE" ]]; then ARGS+=(--base "$BASE"); fi
+        RECEIPT_NAME="${RECEIPT_NAME##*/}"
+        MARKDOWN_NAME="${MARKDOWN_NAME##*/}"
+        for name in "$RECEIPT_NAME" "$MARKDOWN_NAME"; do
+          [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]
+        done
+        RECEIPT="$OUTPUT_DIR/$RECEIPT_NAME"
+        MARKDOWN="$OUTPUT_DIR/$MARKDOWN_NAME"
+        [[ "$RECEIPT" != "$MARKDOWN" && "$RECEIPT" != "$BIN" && "$MARKDOWN" != "$BIN" ]]
+        [[ "$RECEIPT" != "$OUTPUT_DIR/" && "$MARKDOWN" != "$OUTPUT_DIR/" ]]
+        IDENTITY="$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$BIN")"
+        STAGE=sync
+        "$BIN" sync --check --offline --ref "$HEAD"
+        STAGE=verify
+        unset WAYPOST_CI_BASE
+        EXIT=0
+        "$BIN" "${ARGS[@]}" --receipt "$RECEIPT" --markdown "$MARKDOWN" || EXIT=$?
+        if [[ -f "$MARKDOWN" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          cat "$MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
         fi
+        if [[ -f "$RECEIPT" ]]; then printf 'receipt_path=%s\n' "$RECEIPT" >> "$GITHUB_OUTPUT"; fi
+        STAGE=receipt
+        OUTCOME="$(python3 -I - "$RECEIPT" "$IDENTITY" "$HEAD" "$BASE" "$EXIT" <<'PY'
+        import json
+        import sys
 
-        set +e
-        waypost "${ARGS[@]}"
-        EXIT_CODE=$?
-        set -e
+        path, digest, head, base, code = sys.argv[1:]
+        with open(path, encoding="utf-8") as receipt:
+            data = json.load(receipt)
+        outcome = data["summary"]["outcome"]
+        def require(condition, reason):
+            if not condition:
+                raise SystemExit(reason)
 
-        if [ -f "$INPUT_MARKDOWN_PATH" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-          cat "$INPUT_MARKDOWN_PATH" >> "$GITHUB_STEP_SUMMARY"
-        fi
+        require(data["receipt_version"] == "1" and data["authority"] == "ci", "invalid receipt authority")
+        require(data["verifier"]["binary_sha256"] == digest, "verifier identity mismatch")
+        require(data["git"]["head_sha"] == head, "receipt HEAD mismatch")
+        if base and any(char != "0" for char in base):
+            require(data["git"]["target_sha"] == base, "receipt base mismatch")
+        require(outcome in ("PASS", "WARN", "FAIL"), "invalid receipt outcome")
+        require((int(code) == 0) == (outcome != "FAIL"), "receipt outcome disagrees with verifier exit")
+        require(outcome == "FAIL" or data["plan_complete"], "receipt has an incomplete plan")
+        print(outcome)
+        PY
+        )"
+        STAGE=verify
+        if (( EXIT != 0 )); then false; fi
+        printf 'stage=complete\noutcome=%s\n' "$OUTCOME" >> "$GITHUB_OUTPUT"
 
-        OUTCOME="FAIL"
-        if [ -f "$INPUT_RECEIPT_PATH" ]; then
-          OUTCOME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["summary"]["outcome"])' "$INPUT_RECEIPT_PATH" 2>/dev/null || echo "FAIL")
-        fi
-        echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
-        exit "$EXIT_CODE"
 
-    - name: Check Waypost drift
-      if: ${{ !cancelled() && inputs.sync-check == 'true' && (steps.run.outcome == 'success' || steps.run.outcome == 'failure') }}
+    - name: Report gate outcome
+      id: report
+      if: always()
       shell: bash
       env:
-        INPUT_FROZEN: ${{ inputs.frozen }}
+        SETUP_OUTCOME: ${{ steps.setup.outcome }}
+        BUILD_OUTCOME: ${{ steps.verifier.outcome }}
+        GATE_OUTCOME: ${{ steps.gate.outputs.outcome }}
+        GATE_STAGE: ${{ steps.gate.outputs.stage }}
       run: |
-        ARGS=(sync --check)
-        if [ "$INPUT_FROZEN" = "true" ]; then
-          ARGS+=(--offline)
-        fi
-        waypost "${ARGS[@]}"
+        set -euo pipefail
+        case "$SETUP_OUTCOME:$BUILD_OUTCOME" in
+          success:success) STAGE="${GATE_STAGE:-preflight}"; OUTCOME="${GATE_OUTCOME:-FAIL}" ;;
+          success:*) STAGE=build; OUTCOME=FAIL ;;
+          *) STAGE=setup; OUTCOME=FAIL ;;
+        esac
+        printf 'stage=%s\noutcome=%s\n' "$STAGE" "$OUTCOME" >> "$GITHUB_OUTPUT"

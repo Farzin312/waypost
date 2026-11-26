@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -38,46 +40,94 @@ type Snapshot struct {
 // Uses NUL-delimited (`-z`) git output so non-ASCII and special filenames are never C-quoted.
 func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 	snap := &Snapshot{BaseRef: baseRef}
-	if _, err := runGit(repoDir, "rev-parse", "--is-inside-work-tree"); err != nil {
+	_, _, head, isGit := WorktreeIdentity(repoDir)
+	if !isGit {
 		return snap, nil
 	}
-	snap.IsGitRepo = true
+	return InspectWorktree(repoDir, baseRef, mode, head)
+}
 
-	head, err := runGit(repoDir, "rev-parse", "HEAD")
-	if err == nil {
-		snap.HeadSHA = strings.TrimSpace(head)
-	}
-	tree, err := runGit(repoDir, "rev-parse", "HEAD^{tree}")
-	if err == nil {
+func InspectWorktree(repoDir, baseRef, mode, head string) (*Snapshot, error) {
+	snap := &Snapshot{BaseRef: baseRef, IsGitRepo: true, HeadSHA: head}
+	if mode == "ci" {
+		if !ValidSHA(head) {
+			return snap, errors.New("CI requires a committed HEAD")
+		}
+		tree, err := runGit(repoDir, "rev-parse", "--verify", head+"^{tree}")
+		if err != nil {
+			return snap, err
+		}
+		snap.TreeHash = strings.TrimSpace(tree)
+	} else if ValidSHA(head) {
+		tree, _ := runGit(repoDir, "rev-parse", "--verify", head+"^{tree}")
 		snap.TreeHash = strings.TrimSpace(tree)
 	}
-
-	statusOut, err := runGit(repoDir, "status", "--porcelain", "-z")
-	if err == nil {
-		snap.Dirty = len(statusOut) > 0
+	filterArgs, err := inertFilters(repoDir)
+	if err != nil {
+		return snap, err
+	}
+	statusOut, err := runGitBytes(repoDir, append(filterArgs, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=dirty", "--", ".")...)
+	if err != nil {
+		return snap, fmt.Errorf("git status: %w", err)
+	}
+	snap.Dirty = len(statusOut) > 0
+	if mode == "ci" {
+		flags, err := runGitBytes(repoDir, "ls-files", "-v", "--stage", "-z", "--", ".")
+		if err != nil {
+			return snap, fmt.Errorf("git index inventory: %w", err)
+		}
+		for record := range bytes.SplitSeq(flags, []byte{0}) {
+			if len(record) <= 2 {
+				continue
+			}
+			meta, name, ok := strings.Cut(string(record[2:]), "\t")
+			if !ok {
+				return snap, errors.New("malformed Git index entry")
+			}
+			if record[0] == 'S' || record[0] >= 'a' && record[0] <= 'z' {
+				return snap, fmt.Errorf("Git index hides worktree changes for %q", name)
+			}
+			if strings.HasPrefix(meta, "160000 ") {
+				_, dirty, err := SubmoduleState(repoDir, name)
+				if err != nil {
+					return snap, fmt.Errorf("submodule %q: %w", name, err)
+				}
+				snap.Dirty = snap.Dirty || dirty
+			}
+		}
 	}
 
 	// Resolve target commit and strict merge-base.
 	var diffBase string
 	if baseRef != "" {
-		target, targetErr := runGit(repoDir, "rev-parse", "--verify", baseRef+"^{commit}")
+		target, targetErr := head, error(nil)
+		if baseRef != "HEAD" || head == "" {
+			target, targetErr = ResolveCommit(repoDir, baseRef)
+		}
 		if targetErr != nil {
 			snap.MergeBaseError = fmt.Sprintf("unable to resolve base ref %q: %v", baseRef, targetErr)
 			return snap, nil
 		}
 		snap.TargetSHA = strings.TrimSpace(target)
-		mb, err := runGit(repoDir, "merge-base", snap.TargetSHA, "HEAD")
+		mb, err := head, error(nil)
+		if snap.TargetSHA != head {
+			mb, err = runGit(repoDir, "merge-base", snap.TargetSHA, head)
+		}
 		if err != nil {
 			snap.MergeBaseError = fmt.Sprintf("unable to compute merge-base between %q and HEAD: %v", baseRef, err)
 			return snap, nil
 		}
 		diffBase = strings.TrimSpace(mb)
 		snap.BaseSHA = diffBase
-	} else {
-		for _, candidate := range []string{"origin/main", "main", "master"} {
-			if rev, err := runGit(repoDir, "rev-parse", "--verify", candidate+"^{commit}"); err == nil {
+	} else if mode != "ci" {
+		for _, candidate := range []string{"@{upstream}", "origin/main", "main", "master"} {
+			if rev, err := ResolveCommit(repoDir, candidate); err == nil {
 				targetSHA := strings.TrimSpace(rev)
-				if mb, mbErr := runGit(repoDir, "merge-base", targetSHA, "HEAD"); mbErr == nil {
+				mb, mbErr := head, error(nil)
+				if targetSHA != head {
+					mb, mbErr = runGit(repoDir, "merge-base", targetSHA, head)
+				}
+				if mbErr == nil {
 					snap.BaseRef = candidate
 					snap.TargetSHA = targetSHA
 					diffBase = strings.TrimSpace(mb)
@@ -100,13 +150,13 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 	}
 
 	if diffBase != "" {
-		args := []string{"-c", "core.quotepath=false", "diff", "-M", "--name-status", "-z"}
+		args := []string{"-c", "core.quotepath=false", "diff", "--ignore-submodules=dirty", "--no-ext-diff", "--no-textconv", "-M", "--name-status", "-z"}
 		if mode == "ci" {
-			args = append(args, diffBase, "HEAD")
+			args = append(args, diffBase, head)
 		} else {
 			args = append(args, diffBase)
 		}
-		out, err := runGitBytes(repoDir, args...)
+		out, err := runGitBytes(repoDir, append(filterArgs, append(args, "--", ".")...)...)
 		if err != nil {
 			return snap, fmt.Errorf("git diff: %w", err)
 		}
@@ -114,8 +164,11 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 			addChange(ch)
 		}
 	} else if snap.HeadSHA != "" {
-		out, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "diff", "-M", "--name-status", "-z", "HEAD")
-		if err == nil {
+		out, err := runGitBytes(repoDir, append(filterArgs, "-c", "core.quotepath=false", "diff", "--ignore-submodules=dirty", "--no-ext-diff", "--no-textconv", "-M", "--name-status", "-z", "HEAD", "--", ".")...)
+		if err != nil {
+			return snap, fmt.Errorf("git diff: %w", err)
+		}
+		{
 			for _, ch := range ParseNameStatusZ(out) {
 				addChange(ch)
 			}
@@ -124,17 +177,18 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 
 	// Include untracked files in local mode (NUL-delimited).
 	if mode != "ci" {
-		untracked, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z")
-		if err == nil {
-			for _, rawPath := range bytes.Split(untracked, []byte{0}) {
-				p := string(rawPath)
-				if p == "" {
-					continue
-				}
-				norm := filepath.ToSlash(p)
-				if !pathSet[norm] {
-					addChange(Change{Status: "A", Path: norm})
-				}
+		records := bytes.Split(statusOut, []byte{0})
+		for i := 0; i < len(records); i++ {
+			record := records[i]
+			if len(record) < 4 {
+				continue
+			}
+			code, norm := string(record[:2]), string(record[3:])
+			if code == "??" && !pathSet[norm] {
+				addChange(Change{Status: "A", Path: norm})
+			}
+			if strings.ContainsAny(code, "RC") {
+				i++
 			}
 		}
 	}
@@ -224,45 +278,41 @@ func ReadFileAtRef(repoDir, ref, relPath string) ([]byte, bool, error) {
 	if ref == "" {
 		return nil, false, nil
 	}
-	cleanRel := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relPath)), "./")
-	if strings.HasPrefix(cleanRel, "../") || cleanRel == ".." || filepath.IsAbs(relPath) {
-		return nil, false, fmt.Errorf("path %q escapes repository root at ref %s", relPath, ref)
-	}
-	spec := ref + ":./" + cleanRel
-	cmd := exec.Command("git", "-C", repoDir, "show", spec)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := stderr.String()
-		if strings.Contains(msg, "does not exist") || strings.Contains(msg, "exists on disk, but not in") || strings.Contains(msg, "Path ") {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("git show %s: %w (%s)", spec, err, strings.TrimSpace(msg))
-	}
-	return stdout.Bytes(), true, nil
-}
-
-// RegularFilesAtRef returns repository-relative file sizes for regular blobs in a commit.
-func RegularFilesAtRef(repoDir, ref string) (map[string]int64, error) {
-	out, err := runGitBytes(repoDir, "ls-tree", "-r", "-l", "-z", ref, "--", ".")
+	sha, err := ResolveCommit(repoDir, ref)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	files := make(map[string]int64)
-	for _, record := range bytes.Split(out, []byte{0}) {
-		meta, name, ok := strings.Cut(string(record), "\t")
-		fields := strings.Fields(meta)
-		if !ok || len(fields) != 4 || (fields[0] != "100644" && fields[0] != "100755") {
-			continue
-		}
-		size, err := strconv.ParseInt(fields[3], 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("read size of %q at %s: %w", name, ref, err)
-		}
-		files[name] = size
+	if !filepath.IsLocal(relPath) || relPath == "." || filepath.ToSlash(filepath.Clean(relPath)) != relPath {
+		return nil, false, fmt.Errorf("invalid repository file %q", relPath)
 	}
-	return files, nil
+	entry, err := Git(repoDir, "ls-tree", "-z", sha, "--", ":(literal)"+relPath)
+	if err != nil || len(entry) == 0 {
+		return nil, false, err
+	}
+	meta, name, ok := strings.Cut(strings.TrimSuffix(string(entry), "\x00"), "\t")
+	fields := strings.Fields(meta)
+	if !ok || name != relPath || len(fields) != 3 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") || !ValidSHA(fields[2]) {
+		return nil, false, fmt.Errorf("%q is not a regular file at %s", relPath, sha)
+	}
+	const limit = 4 << 20
+	cmd := exec.Command("git", "--no-replace-objects", "--no-lazy-fetch", "-C", repoDir, "cat-file", "blob", fields[2])
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, false, err
+	}
+	if err = cmd.Start(); err != nil {
+		return nil, false, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(stdout, limit+1))
+	if len(raw) > limit || err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, false, fmt.Errorf("%q exceeds %d bytes or could not be read", relPath, limit)
+	}
+	if err = cmd.Wait(); err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
 }
 
 // ListTrackedFiles lists all tracked files in the git repo using NUL-delimited output.
@@ -300,8 +350,9 @@ func runGit(repoDir string, args ...string) (string, error) {
 }
 
 func runGitBytes(repoDir string, args ...string) ([]byte, error) {
-	fullArgs := append([]string{"-C", repoDir}, args...)
+	fullArgs := append([]string{"--no-replace-objects", "--no-lazy-fetch", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", repoDir}, args...)
 	cmd := exec.Command("git", fullArgs...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -315,27 +366,122 @@ func runGitBytes(repoDir string, args ...string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-// ReadBoundedRegularFileAtRef checks the Git tree entry before reading its blob.
-func ReadBoundedRegularFileAtRef(repoDir, ref, relPath string, maxBytes int) ([]byte, bool, error) {
-	if !filepath.IsLocal(relPath) || relPath == "." || filepath.ToSlash(filepath.Clean(relPath)) != relPath {
-		return nil, false, fmt.Errorf("invalid repository path %q", relPath)
-	}
-	out, err := runGitBytes(repoDir, "ls-tree", "-l", "-z", ref, "--", ":(literal)"+relPath)
+var objectID = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
+func ValidSHA(s string) bool { return objectID.MatchString(s) }
+
+func ResolveCommit(repo, ref string) (string, error) {
+	out, err := runGit(repo, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+	out = strings.TrimSpace(out)
 	if err != nil {
-		return nil, false, err
+		return "", err
 	}
-	if len(out) == 0 {
-		return nil, false, nil
+	if !ValidSHA(out) {
+		return "", fmt.Errorf("invalid commit object ID for %q", ref)
 	}
-	meta, name, ok := strings.Cut(strings.TrimSuffix(string(out), "\x00"), "\t")
-	fields := strings.Fields(meta)
-	if !ok || name != relPath || len(fields) != 4 || fields[1] != "blob" ||
-		(fields[0] != "100644" && fields[0] != "100755") {
-		return nil, false, fmt.Errorf("%q at %s is not a regular file", relPath, ref)
+	return out, nil
+}
+
+func IsRepository(repo string) bool {
+	out, err := runGit(repo, "rev-parse", "--is-inside-work-tree")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// Git executes a static Git plumbing command with replacement objects and lazy fetch disabled.
+func Git(repo string, args ...string) ([]byte, error) { return runGitBytes(repo, args...) }
+
+// Diff reports path changes, using an empty tree when parent is empty.
+func Diff(repo, parent, child string) ([]Change, error) {
+	if !ValidSHA(child) || (parent != "" && !ValidSHA(parent)) {
+		return nil, errors.New("diff requires verified commit IDs")
 	}
-	size, err := strconv.ParseInt(fields[3], 10, 64)
-	if err != nil || size < 0 || size > int64(maxBytes) {
-		return nil, false, fmt.Errorf("%q at %s exceeds %d bytes", relPath, ref, maxBytes)
+	args := []string{"diff-tree", "--no-ext-diff", "--no-textconv", "--no-commit-id", "-r", "-M", "--name-status", "-z"}
+	if parent == "" {
+		args = append(args, "--root", child)
+	} else {
+		args = append(args, parent, child)
 	}
-	return ReadFileAtRef(repoDir, ref, relPath)
+	raw, err := Git(repo, append(args, "--", ".")...)
+	return ParseNameStatusZ(raw), err
+}
+
+// Git status and worktree diff can otherwise invoke configured clean filters.
+func inertFilters(repo string) ([]string, error) {
+	cmd := exec.Command("git", "-C", repo, "config", "--null", "--name-only", "--get-regexp", `^filter\..*\.(clean|process|required)$`)
+	raw, err := cmd.Output()
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list Git filters: %w", err)
+	}
+	var opts []string
+	for record := range bytes.SplitSeq(raw, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		key := string(record)
+		value := ""
+		if strings.HasSuffix(key, ".required") {
+			value = "false"
+		}
+		opts = append(opts, "-c", key+"="+value)
+	}
+	return opts, nil
+}
+
+// WorktreeIdentity resolves project location and HEAD in one invocation.
+func WorktreeIdentity(repo string) (dir, prefix, head string, ok bool) {
+	raw, err := Git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--is-inside-work-tree", "--show-prefix", "--revs-only", "HEAD^{commit}")
+	if err != nil {
+		return "", "", "", false
+	}
+	// --show-prefix emits an empty line for the worktree root.
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if len(lines) < 3 || lines[1] != "true" {
+		return "", "", "", false
+	}
+	if len(lines) > 3 && ValidSHA(lines[len(lines)-1]) {
+		head, lines = lines[len(lines)-1], lines[:len(lines)-1]
+	}
+	return lines[0], strings.Join(lines[2:], "\n"), head, true
+}
+
+// WorktreeChanges returns paths whose worktree stat or mode differs from the index.
+// A cached blob is safe only when the entry also has a normal index stage and flags.
+func WorktreeChanges(repo string) (map[string]bool, error) {
+	opts, err := inertFilters(repo)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := Git(repo, append(opts, "-c", "core.filemode=true", "-c", "core.trustctime=true", "-c", "core.checkStat=default",
+		"diff-files", "--ignore-submodules=dirty", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "--", ".")...)
+	changed := make(map[string]bool)
+	for name := range bytes.SplitSeq(raw, []byte{0}) {
+		if len(name) > 0 {
+			changed[string(name)] = true
+		}
+	}
+	return changed, err
+}
+
+// SubmoduleState checks a populated gitlink using the submodule's own inert
+// filter configuration. An uninitialized directory has no worktree state.
+func SubmoduleState(repo, rel string) (head string, dirty bool, err error) {
+	dir := filepath.Join(repo, filepath.FromSlash(rel))
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, err
+	}
+	head, err = ResolveCommit(dir, "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	opts, err := inertFilters(dir)
+	if err != nil {
+		return "", false, err
+	}
+	raw, err := Git(dir, append(opts, "status", "--porcelain", "-z", "--ignore-submodules=dirty")...)
+	return head, len(raw) > 0, err
 }

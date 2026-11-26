@@ -16,10 +16,11 @@ const maxSampleSitesPerEdge = 5
 
 // ImportSite pinpoints a concrete file:line import in the repository.
 type ImportSite struct {
-	File       string `json:"file"`
-	Line       int    `json:"line"`
-	Specifier  string `json:"specifier"`
-	TargetFile string `json:"target_file"`
+	File             string `json:"file"`
+	Line             int    `json:"line"`
+	Specifier        string `json:"specifier"`
+	TargetFile       string `json:"target_file"`
+	TargetPackageDir string `json:"-"`
 }
 
 // ComponentEdge summarizes all observed static code imports from component From to To.
@@ -64,19 +65,20 @@ type CycleWitness struct {
 
 // Violation represents one concrete architectural boundary breach with exact file:line location.
 type Violation struct {
-	RuleID       string      `json:"rule_id"`
-	Kind         string      `json:"kind"`     // "cycle" | "undeclared-dependency" | "disallowed-dependency" | "denied-dependency" | "private-import"
-	Severity     string      `json:"severity"` // "error" | "warn"
-	From         string      `json:"from"`
-	To           string      `json:"to,omitempty"`
-	File         string      `json:"file,omitempty"`
-	Line         int         `json:"line,omitempty"`
-	Specifier    string      `json:"specifier,omitempty"`
-	TargetFile   string      `json:"target_file,omitempty"`
-	Message      string      `json:"message"`
-	CyclePath    []string    `json:"cycle_path,omitempty"`
-	CycleMembers []string    `json:"cycle_members,omitempty"`
-	CycleEdges   []CycleEdge `json:"cycle_edges,omitempty"`
+	RuleID           string      `json:"rule_id"`
+	Kind             string      `json:"kind"`     // "cycle" | "undeclared-dependency" | "disallowed-dependency" | "denied-dependency" | "private-import"
+	Severity         string      `json:"severity"` // "error" | "warn"
+	From             string      `json:"from"`
+	To               string      `json:"to,omitempty"`
+	File             string      `json:"file,omitempty"`
+	Line             int         `json:"line,omitempty"`
+	Specifier        string      `json:"specifier,omitempty"`
+	TargetFile       string      `json:"target_file,omitempty"`
+	TargetPackageDir string      `json:"-"`
+	Message          string      `json:"message"`
+	CyclePath        []string    `json:"cycle_path,omitempty"`
+	CycleMembers     []string    `json:"cycle_members,omitempty"`
+	CycleEdges       []CycleEdge `json:"cycle_edges,omitempty"`
 }
 
 // BlastRadius reports file-level and component-level reverse impact for a set of changed files.
@@ -231,10 +233,11 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 		acc.count++
 		if len(acc.samples) < maxSampleSitesPerEdge {
 			acc.samples = append(acc.samples, ImportSite{
-				File:       imp.File,
-				Line:       imp.Line,
-				Specifier:  imp.Specifier,
-				TargetFile: imp.TargetFile,
+				File:             imp.File,
+				Line:             imp.Line,
+				Specifier:        imp.Specifier,
+				TargetFile:       imp.TargetFile,
+				TargetPackageDir: imp.TargetPackageDir,
 			})
 		}
 		if obsDeps[fromComp] == nil {
@@ -351,6 +354,7 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 					v.Line = w.Line
 					v.Specifier = w.Specifier
 					v.TargetFile = w.TargetFile
+					v.TargetPackageDir = w.TargetPackageDir
 				}
 				violations = append(violations, v)
 			}
@@ -362,16 +366,17 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 				fromComp, toComp := imp.from, imp.to
 				if !declaredDeps[fromComp][toComp] {
 					violations = append(violations, Violation{
-						RuleID:     "enforce-declared-deps",
-						Kind:       "undeclared-dependency",
-						Severity:   severity,
-						From:       fromComp,
-						To:         toComp,
-						File:       imp.File,
-						Line:       imp.Line,
-						Specifier:  imp.Specifier,
-						TargetFile: imp.TargetFile,
-						Message:    fmt.Sprintf("%s:%d (%s) imports %s (%s), which is not listed in %s.depends_on", imp.File, imp.Line, fromComp, toComp, imp.Specifier, fromComp),
+						RuleID:           "enforce-declared-deps",
+						Kind:             "undeclared-dependency",
+						Severity:         severity,
+						From:             fromComp,
+						To:               toComp,
+						File:             imp.File,
+						Line:             imp.Line,
+						Specifier:        imp.Specifier,
+						TargetFile:       imp.TargetFile,
+						TargetPackageDir: imp.TargetPackageDir,
+						Message:          fmt.Sprintf("%s:%d (%s) imports %s (%s), which is not listed in %s.depends_on", imp.File, imp.Line, fromComp, toComp, imp.Specifier, fromComp),
 					})
 				}
 			}
@@ -396,16 +401,17 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 								reason = fmt.Sprintf("component %q is only allowed to depend on %v", fromComp, *rule.AllowDependsOn)
 							}
 							violations = append(violations, Violation{
-								RuleID:     rule.ID,
-								Kind:       "disallowed-dependency",
-								Severity:   severity,
-								From:       fromComp,
-								To:         toComp,
-								File:       imp.File,
-								Line:       imp.Line,
-								Specifier:  imp.Specifier,
-								TargetFile: imp.TargetFile,
-								Message:    fmt.Sprintf("%s:%d (%s -> %s via %q): %s", imp.File, imp.Line, fromComp, toComp, imp.Specifier, reason),
+								RuleID:           rule.ID,
+								Kind:             "disallowed-dependency",
+								Severity:         severity,
+								From:             fromComp,
+								To:               toComp,
+								File:             imp.File,
+								Line:             imp.Line,
+								Specifier:        imp.Specifier,
+								TargetFile:       imp.TargetFile,
+								TargetPackageDir: imp.TargetPackageDir,
+								Message:          fmt.Sprintf("%s:%d (%s -> %s via %q): %s", imp.File, imp.Line, fromComp, toComp, imp.Specifier, reason),
 							})
 						}
 					}
@@ -416,16 +422,17 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 								reason = fmt.Sprintf("component %q must not depend on %q", fromComp, toComp)
 							}
 							violations = append(violations, Violation{
-								RuleID:     rule.ID,
-								Kind:       "denied-dependency",
-								Severity:   severity,
-								From:       fromComp,
-								To:         toComp,
-								File:       imp.File,
-								Line:       imp.Line,
-								Specifier:  imp.Specifier,
-								TargetFile: imp.TargetFile,
-								Message:    fmt.Sprintf("%s:%d (%s -> %s via %q): %s", imp.File, imp.Line, fromComp, toComp, imp.Specifier, reason),
+								RuleID:           rule.ID,
+								Kind:             "denied-dependency",
+								Severity:         severity,
+								From:             fromComp,
+								To:               toComp,
+								File:             imp.File,
+								Line:             imp.Line,
+								Specifier:        imp.Specifier,
+								TargetFile:       imp.TargetFile,
+								TargetPackageDir: imp.TargetPackageDir,
+								Message:          fmt.Sprintf("%s:%d (%s -> %s via %q): %s", imp.File, imp.Line, fromComp, toComp, imp.Specifier, reason),
 							})
 							break
 						}
@@ -441,16 +448,17 @@ func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesC
 							reason = fmt.Sprintf("external imports into %q must go through public entrypoints %v", toComp, rule.PublicEntrypoints)
 						}
 						violations = append(violations, Violation{
-							RuleID:     rule.ID,
-							Kind:       "private-import",
-							Severity:   severity,
-							From:       fromComp,
-							To:         toComp,
-							File:       imp.File,
-							Line:       imp.Line,
-							Specifier:  imp.Specifier,
-							TargetFile: imp.TargetFile,
-							Message:    fmt.Sprintf("%s:%d (%s deep-imports private file %s in %s): %s", imp.File, imp.Line, fromComp, imp.TargetFile, toComp, reason),
+							RuleID:           rule.ID,
+							Kind:             "private-import",
+							Severity:         severity,
+							From:             fromComp,
+							To:               toComp,
+							File:             imp.File,
+							Line:             imp.Line,
+							Specifier:        imp.Specifier,
+							TargetFile:       imp.TargetFile,
+							TargetPackageDir: imp.TargetPackageDir,
+							Message:          fmt.Sprintf("%s:%d (%s deep-imports private file %s in %s): %s", imp.File, imp.Line, fromComp, imp.TargetFile, toComp, reason),
 						})
 					}
 				}
@@ -594,29 +602,7 @@ func (r *Report) ComputeBlastRadius(changedFiles []string) BlastRadius {
 // primaryOwnerOf picks the single most-specific owning component for a source file
 // (preferring specific subsystem roots over root "." catch-all "**").
 func primaryOwnerOf(cm *compmap.Map, relFile string) string {
-	var best *compmap.Component
-	bestScore := -1
-	for i := range cm.Components {
-		c := &cm.Components[i]
-		if !compmap.MatchAnyGlob(c.Paths, relFile) {
-			continue
-		}
-		score := len(c.Root) * 10
-		if c.Root == "." && len(c.Paths) == 1 && c.Paths[0] == "**" {
-			score = 0
-		}
-		if c.Provenance == compmap.ProvenanceDeclared {
-			score += 2
-		}
-		if best == nil || score > bestScore || (score == bestScore && c.ID < best.ID) {
-			best = c
-			bestScore = score
-		}
-	}
-	if best == nil {
-		return ""
-	}
-	return best.ID
+	return cm.PrimaryOwner(relFile)
 }
 
 // MatchesComponentPattern reports whether a boundary selector matches a component ID.

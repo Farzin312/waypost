@@ -87,7 +87,7 @@ checks:
 	}
 	if err := os.WriteFile(filepath.Join(repoTS, ".waypost.yaml"), []byte(`schema_version: "1"
 name: mobile-app
-extends: "../org-presets/org-v1.yaml"
+extends: "org-presets/org-v1.yaml"
 components:
   - id: api-client
     root: src/api
@@ -114,6 +114,13 @@ checks:
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	for _, source := range []string{presetV1, presetV2} {
+		raw, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWriteFile(t, filepath.Join(repoTS, "org-presets", filepath.Base(source)), string(raw))
+	}
 	mustGit(t, repoTS, "init", "-b", "main")
 	mustGit(t, repoTS, "add", ".")
 	mustGit(t, repoTS, "commit", "-m", "init ts repo")
@@ -134,7 +141,7 @@ checks:
 	}
 	if err := os.WriteFile(filepath.Join(repoUE, ".waypost.yaml"), []byte(`schema_version: "1"
 name: game-repo
-extends: "../org-presets/org-v1.yaml"
+extends: "org-presets/org-v1.yaml"
 components:
   - id: validators
     root: tools
@@ -154,6 +161,13 @@ checks:
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	for _, source := range []string{presetV1, presetV2} {
+		raw, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWriteFile(t, filepath.Join(repoUE, "org-presets", filepath.Base(source)), string(raw))
+	}
 	mustGit(t, repoUE, "init", "-b", "main")
 	mustGit(t, repoUE, "add", ".")
 	mustGit(t, repoUE, "commit", "-m", "init unreal repo")
@@ -165,10 +179,12 @@ checks:
 		if code := Run([]string{"upgrade", "--dir", repo, "--apply"}, &out, &errBuf); code != 0 {
 			t.Fatalf("initial lock failed in %s: %s", repo, errBuf.String())
 		}
+		mustGit(t, repo, "add", ".waypost.lock")
+		mustGit(t, repo, "commit", "-m", "freeze legacy preset")
 		// Dry-run upgrade to v1.1
 		out.Reset()
 		errBuf.Reset()
-		if code := Run([]string{"upgrade", "--dir", repo, "--target", "../org-presets/org-v1.1.yaml", "--format", "json"}, &out, &errBuf); code != 0 {
+		if code := Run([]string{"upgrade", "--dir", repo, "--target", "org-presets/org-v1.1.yaml", "--format", "json"}, &out, &errBuf); code != 0 {
 			t.Fatalf("dry-run upgrade failed in %s: %s", repo, errBuf.String())
 		}
 		if !strings.Contains(out.String(), "receipt-provenance-v2") || !strings.Contains(out.String(), "legacy-checklist-crutch") {
@@ -178,7 +194,7 @@ checks:
 		// Apply upgrade to v1.1
 		out.Reset()
 		errBuf.Reset()
-		if code := Run([]string{"upgrade", "--dir", repo, "--target", "../org-presets/org-v1.1.yaml", "--apply"}, &out, &errBuf); code != 0 {
+		if code := Run([]string{"upgrade", "--dir", repo, "--target", "org-presets/org-v1.1.yaml", "--apply"}, &out, &errBuf); code != 0 {
 			t.Fatalf("apply upgrade failed in %s: %s", repo, errBuf.String())
 		}
 
@@ -190,7 +206,7 @@ checks:
 		out.Reset()
 		errBuf.Reset()
 		receiptFile := filepath.Join(repo, ".waypost/receipt.v1.json")
-		if code := Run([]string{"verify", "--dir", repo, "--mode", "ci", "--frozen", "--all", "--receipt", receiptFile, "--format", "json"}, &out, &errBuf); code != 0 {
+		if code := Run([]string{"verify", "--dir", repo, "--mode", "ci", "--frozen", "--base", "HEAD^", "--all", "--receipt", receiptFile, "--format", "json"}, &out, &errBuf); code != 0 {
 			t.Fatalf("frozen CI verify failed in %s: %s\nstdout: %s", repo, errBuf.String(), out.String())
 		}
 		var rec verify.Receipt

@@ -1,0 +1,51 @@
+schema_version: "1"
+name: builtin-app-ts
+preset_version: "1.1.0"
+extends: "builtin:base@1.1.0"
+description: "Preset for TypeScript web/mobile apps with optional backend contract pins and native boundaries."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - ".waypost.yaml"
+    - ".waypost.lock"
+    - ".github/workflows/**"
+    - "AGENTS.md"
+    - "package.json"
+    - "pnpm-lock.yaml"
+    - "package-lock.json"
+    - "bun.lock"
+    - ".gitleaks.toml"
+rules:
+  - id: no-unverified-contract-drift
+    kind: invariant
+    summary: "Changes touching API clients or shared schemas must pass declared cross-repo compatibility checks."
+  - id: respect-module-boundaries
+    kind: invariant
+    summary: "Keep cross-feature imports aligned with the declared component graph and native boundary rules."
+  - id: prefer-typed-narrow-edits
+    kind: crutch
+    summary: "Run typecheck after editing shared types before cascading edits across screens or routes."
+    review_after: "2027-06-01"
+checks:
+  - id: ts-typecheck
+    command: "npm run typecheck"
+    paths: ["**/*.ts", "**/*.tsx", "tsconfig*.json", "package.json"]
+    required: true
+    timeout_seconds: 180
+    description: "TypeScript static type verification"
+  - id: ts-test
+    command: "npm test"
+    paths: ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "package.json"]
+    required: true
+    timeout_seconds: 300
+    description: "Unit and integration test suite"
+skills:
+  - id: agents-md-standard
+    source: "https://agents.md"
+    version: "1.0"
+    kind: invariant
+    authorized: false
+    description: "AAIF AGENTS.md concise repo entry contract"
+providers: []

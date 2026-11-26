@@ -5,12 +5,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/remote"
+	"github.com/Farzin312/waypost/internal/repopath"
+	"github.com/Farzin312/waypost/internal/repowrite"
 	"github.com/Farzin312/waypost/internal/version"
 	"gopkg.in/yaml.v3"
 )
@@ -96,54 +99,34 @@ func Marshal(lf Lockfile) ([]byte, error) {
 	return append([]byte(header), out...), nil
 }
 
-// Write writes <repoDir>/.waypost.lock atomically using an exclusively created temp file
-// (never following pre-existing symlinks) and returns its SHA-256 digest.
+// Write publishes .waypost.lock under the policy writer lock and returns its SHA-256 digest.
 func Write(repoDir string, lf Lockfile) (string, error) {
 	b, err := Marshal(lf)
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(repoDir, LockFileName)
-	f, err := os.CreateTemp(repoDir, ".waypost-lock-*.tmp")
+	tx, close, err := repowrite.Acquire(repoDir)
 	if err != nil {
-		return "", fmt.Errorf("create temp lockfile: %w", err)
+		return "", err
 	}
-	tmpName := f.Name()
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("write temp lockfile: %w", err)
+	defer close()
+	previous, err := repowrite.Read(repoDir, LockFileName)
+	if err != nil {
+		return "", err
 	}
-	if err := f.Chmod(0o644); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("chmod temp lockfile: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("close temp lockfile: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("rename lockfile: %w", err)
+	if err := tx.Commit(repowrite.Mutation{Path: LockFileName, Old: previous, New: b}); err != nil {
+		return "", err
 	}
 	return sha256Hex(b), nil
 }
 
 // Read parses <repoDir>/.waypost.lock and returns the Lockfile plus its raw SHA-256 digest.
 func Read(repoDir string) (*Lockfile, string, error) {
-	path := filepath.Join(repoDir, LockFileName)
-	b, err := os.ReadFile(path)
+	b, err := repopath.Read(repoDir, LockFileName, repopath.MaxPolicyBytes)
 	if err != nil {
 		return nil, "", err
 	}
-	var lf Lockfile
-	dec := yaml.NewDecoder(strings.NewReader(string(b)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&lf); err != nil {
-		return nil, "", fmt.Errorf("parse %s: %w", path, err)
-	}
-	return &lf, sha256Hex(b), nil
+	return ParseBytes(b)
 }
 
 // Verify checks <repoDir>/.waypost.lock against the currently resolved config (without local overrides).
@@ -164,6 +147,10 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 		}
 	}
 
+	return VerifyParsed(lf, digest, canonicalRes)
+}
+
+func VerifyParsed(lf *Lockfile, digest string, canonicalRes *config.ResolvedConfig) VerifyResult {
 	res := VerifyResult{
 		Present:    true,
 		Valid:      true,
@@ -190,7 +177,7 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 		res.Mismatches = append(res.Mismatches, fmt.Sprintf("inheritance chain length changed: lock=%d current=%d", len(lf.Chain), len(canonicalRes.Chain)))
 	} else {
 		for i := range lf.Chain {
-			if lf.Chain[i].Ref != canonicalRes.Chain[i].Ref || lf.Chain[i].SHA256 != canonicalRes.Chain[i].SHA256 {
+			if lf.Chain[i] != canonicalRes.Chain[i] {
 				res.Mismatches = append(res.Mismatches, fmt.Sprintf("ancestor %d changed: lock=(%s %s) current=(%s %s)",
 					i, lf.Chain[i].Ref, shortHash(lf.Chain[i].SHA256), canonicalRes.Chain[i].Ref, shortHash(canonicalRes.Chain[i].SHA256)))
 			}
@@ -221,6 +208,14 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 		}
 	}
 
+	expected := Generate(canonicalRes)
+	if !slices.Equal(lf.Skills, expected.Skills) {
+		res.Mismatches = append(res.Mismatches, "locked skill definitions changed")
+	}
+	if !slices.Equal(lf.Providers, expected.Providers) {
+		res.Mismatches = append(res.Mismatches, "locked provider definitions changed")
+	}
+
 	if len(res.Mismatches) > 0 || len(res.AuthorizationEscalation) > 0 {
 		res.Valid = false
 	}
@@ -247,6 +242,9 @@ func ParseBytes(b []byte) (*Lockfile, string, error) {
 	if err := dec.Decode(&lf); err != nil {
 		return nil, "", fmt.Errorf("parse lockfile: %w", err)
 	}
+	if err := dec.Decode(new(yaml.Node)); err != io.EOF {
+		return nil, "", fmt.Errorf("parse lockfile: expected one YAML document")
+	}
 	return &lf, sha256Hex(b), nil
 }
 
@@ -261,6 +259,19 @@ func PinnedRemoteSHAs(lf *Lockfile) map[string]string {
 		sha := strings.ToLower(strings.TrimSpace(step.SHA256))
 		if step.Source == "remote" && ref != "" && remote.IsValidSHA256Hex(sha) {
 			out[ref] = sha
+		}
+	}
+	return out
+}
+
+// PinnedBuiltins indexes exact builtin ancestors by name for floating references.
+func PinnedBuiltins(lf *Lockfile) map[string]string {
+	out := make(map[string]string)
+	if lf != nil {
+		for _, step := range lf.Chain {
+			if name, ver, ok := strings.Cut(step.Ref, "@"); step.Source == "builtin" && ok && ver == step.Version {
+				out[name] = step.Ref
+			}
 		}
 	}
 	return out

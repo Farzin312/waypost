@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-//go:embed base.yaml app-ts.yaml polyglot-native.yaml
+//go:embed *.yaml
 var fs embed.FS
 
 // BuiltinRef represents a resolved embedded preset.
@@ -21,13 +21,28 @@ type BuiltinRef struct {
 	Raw     []byte
 }
 
-var catalog = map[string]struct {
-	file    string
-	version string
-}{
-	"base":            {file: "base.yaml", version: "1.0.0"},
-	"app-ts":          {file: "app-ts.yaml", version: "1.0.0"},
-	"polyglot-native": {file: "polyglot-native.yaml", version: "1.0.0"},
+const LatestVersion = "1.1.0"
+
+var catalog = map[string]map[string]string{
+	"base":            {"1.0.0": "base.yaml", "1.1.0": "base-1.1.0.yaml"},
+	"app-ts":          {"1.0.0": "app-ts.yaml", "1.1.0": "app-ts-1.1.0.yaml"},
+	"polyglot-native": {"1.0.0": "polyglot-native.yaml", "1.1.0": "polyglot-native-1.1.0.yaml"},
+}
+
+func Floating(ref string) bool {
+	_, v, _ := strings.Cut(strings.TrimSpace(ref), "@")
+	return v == "" || v == "v1" || v == "latest"
+}
+
+// Anchor resolves a floating ref through the exact versions in a frozen chain.
+func Anchor(ref string, pinned map[string]string) string {
+	if IsBuiltin(ref) && Floating(ref) {
+		name, _, _ := strings.Cut(strings.TrimSpace(ref), "@")
+		if exact := pinned[name]; exact != "" {
+			return exact
+		}
+	}
+	return ref
 }
 
 // Names returns all built-in preset names in sorted order.
@@ -58,22 +73,26 @@ func Resolve(ref string) (*BuiltinRef, error) {
 		name = rest[:idx]
 		reqVer = rest[idx+1:]
 	}
-	entry, ok := catalog[name]
+	versions, ok := catalog[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown builtin preset %q (available: %s)", name, strings.Join(Names(), ", "))
 	}
-	if reqVer != "" && reqVer != entry.version && reqVer != "v1" && reqVer != "latest" {
-		return nil, fmt.Errorf("builtin preset %q has version %s, requested %q", name, entry.version, reqVer)
+	if Floating(trimmed) {
+		reqVer = LatestVersion
 	}
-	raw, err := fs.ReadFile(entry.file)
+	file, ok := versions[reqVer]
+	if !ok {
+		return nil, fmt.Errorf("unknown version %q of builtin preset %q", reqVer, name)
+	}
+	raw, err := fs.ReadFile(file)
 	if err != nil {
 		return nil, fmt.Errorf("read embedded preset %q: %w", name, err)
 	}
 	sum := sha256.Sum256(raw)
 	return &BuiltinRef{
 		Name:    name,
-		Version: entry.version,
-		Ref:     fmt.Sprintf("builtin:%s@%s", name, entry.version),
+		Version: reqVer,
+		Ref:     fmt.Sprintf("builtin:%s@%s", name, reqVer),
 		SHA256:  hex.EncodeToString(sum[:]),
 		Raw:     raw,
 	}, nil

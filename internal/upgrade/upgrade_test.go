@@ -59,7 +59,7 @@ extends: "../org-v1.yaml"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res1, err := config.Load(repo, config.LoadOptions{Mode: "ci"})
+	res1, err := config.Load(repo, config.LoadOptions{Mode: "local"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ extends: "../org-v1.yaml"
 		t.Fatalf("expected applied=true with lock digest, got %+v", applied)
 	}
 
-	res2, err := config.Load(repo, config.LoadOptions{Mode: "ci"})
+	res2, err := config.Load(repo, config.LoadOptions{Mode: "local"})
 	if err != nil {
 		t.Fatal(err)
 	}

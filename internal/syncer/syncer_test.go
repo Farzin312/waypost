@@ -12,6 +12,7 @@ import (
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/lockfile"
+	"github.com/Farzin312/waypost/internal/repopath"
 )
 
 func TestSyncAppliesSafeDriftAndPreservesYAML(t *testing.T) {
@@ -212,7 +213,7 @@ components: [{id: app, root: app}, {id: api, root: api}]
 
 func TestSyncRejectsOversizedRootConfig(t *testing.T) {
 	dir := t.TempDir()
-	syncWrite(t, dir, config.ConfigFileName, "schema_version: '1'\n# "+strings.Repeat("x", compmap.MaxStaticDiscoveryBytes))
+	syncWrite(t, dir, config.ConfigFileName, "schema_version: '1'\n# "+strings.Repeat("x", repopath.MaxPolicyBytes))
 	if _, err := Run(dir, Options{Apply: true}); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("sync accepted an oversized root config: %v", err)
 	}
@@ -381,5 +382,109 @@ func TestSyncAvoidsReadingEscapingManifestsAndReplacingSymlinkLocks(t *testing.T
 	}
 	if got := string(syncRead(t, outside, "lock")); got != "keep untouched" {
 		t.Fatalf("external lock was modified: %s", got)
+	}
+}
+
+func TestSyncExpiredCrutchIsAdvisoryAndNeverRemoved(t *testing.T) {
+	dir := t.TempDir()
+	raw := `schema_version: "1"
+rules:
+  - {id: expired, kind: crutch, summary: temporary, review_after: "2000-01-01"}
+  - {id: future, kind: crutch, summary: temporary, review_after: "2999-01-01"}
+  - {id: lasting, kind: invariant, summary: lasting, review_after: "2000-01-01"}
+`
+	syncWrite(t, dir, config.ConfigFileName, raw)
+	first, err := Run(dir, Options{Apply: true})
+	if err != nil || first.Pending() {
+		t.Fatalf("unexpected apply %+v %v", first, err)
+	}
+	second, err := Run(dir, Options{})
+	if err != nil || second.Pending() || !slices.Equal(subjectsOf(second, "expired_crutch"), []string{"expired"}) {
+		t.Fatalf("unexpected expiry %+v %v", second, err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, config.ConfigFileName))
+	if err != nil || string(got) != raw {
+		t.Fatalf("sync modified rule file: %s %v", got, err)
+	}
+}
+
+func TestSyncWorkspaceScriptsAndTypedPinDrift(t *testing.T) {
+	dir := t.TempDir()
+	syncWrite(t, dir, config.ConfigFileName, `schema_version: "1"
+checks:
+  - {id: workspace, command: 'npm run build -w demo-widget'}
+  - {id: dynamic, command: 'cd packages/widget && npm run "$SCRIPT"'}
+pins:
+  - id: demo
+    producer: org/demo
+    consumer: org/app
+    artifact: demo-widget
+    version: 1.0.0
+    source: {kind: npm-package-version, manifest: packages/widget/package.json}
+`)
+	syncWrite(t, dir, "package.json", `{"workspaces":["packages/*"]}`)
+	syncWrite(t, dir, "packages/widget/package.json", `{"name":"demo-widget","version":"2.0.0","scripts":{"build":"touch should-not-run"}}`)
+	result, err := Run(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subjectsOf(result, "missing_script")) != 0 || !slices.Equal(subjectsOf(result, "script_unknown"), []string{"dynamic"}) ||
+		!slices.Equal(subjectsOf(result, "pin_drift"), []string{"demo"}) {
+		t.Fatalf("unexpected workspace/pin findings %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "should-not-run")); !os.IsNotExist(err) {
+		t.Fatalf("sync ran script: %v", err)
+	}
+}
+
+func TestSyncBlocksAuthorizationAndMalformedDiscovery(t *testing.T) {
+	for _, fixture := range []struct{ name, path, data string }{
+		{"provider command", config.ConfigFileName, "schema_version: '1'\nproviders: [{id: tool, tool: sh, command: 'echo changed', authorized: true}]\n"},
+		{"skill authorization", config.ConfigFileName, "schema_version: '1'\nskills: [{id: skill, source: example, authorized: true}]\n"},
+		{"bounds root", ".bounds/root.yaml", "subsystems: ["},
+		{"bounds manifest", ".bounds/manifests/example.yaml", "name: ["},
+		{"Unreal project", "Example.uproject", `{"Modules":"not a module array"}`},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			dir := t.TempDir()
+			const original = "schema_version: '1'\nproviders: [{id: tool, tool: sh, command: 'echo existing', authorized: true}]\nskills: [{id: skill, source: example, authorized: false}]\n"
+			syncWrite(t, dir, config.ConfigFileName, original)
+			res, err := config.Load(dir, config.LoadOptions{Mode: "ci"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := lockfile.Write(dir, lockfile.Generate(res)); err != nil {
+				t.Fatal(err)
+			}
+			lockPath := filepath.Join(dir, lockfile.LockFileName)
+			before, err := os.ReadFile(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			syncWrite(t, dir, fixture.path, fixture.data)
+			report, err := Run(dir, Options{Apply: true, Offline: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			kind := "manifest_error"
+			if fixture.path == config.ConfigFileName {
+				kind = "authorization_changed"
+			}
+			if !slices.ContainsFunc(report.Items, func(i Item) bool { return i.Kind == kind && i.Actionable() && !i.Fixable && !i.Applied }) {
+				t.Fatalf("missing blocking %s: %+v", kind, report)
+			}
+			after, err := os.ReadFile(lockPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("lock changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestSyncAndProjectSharePolicySizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	syncWrite(t, dir, config.ConfigFileName, "schema_version: '1'\n# "+strings.Repeat("a", 1<<20))
+	if report, err := Run(dir, Options{Apply: true}); err != nil || report.Pending() {
+		t.Fatalf("policy within shared maximum: %+v %v", report, err)
 	}
 }

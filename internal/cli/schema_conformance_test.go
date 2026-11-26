@@ -24,6 +24,29 @@ import (
 // validateAgainstSchema validates a parsed JSON/YAML value against our Draft 2020-12
 // JSON Schema subset exercised by the Waypost schemas.
 func validateAgainstSchema(schema map[string]any, val any, path string) []string {
+	return validateSchema(schema, schema, val, path)
+}
+
+func validateSchema(root, schema map[string]any, val any, path string) []string {
+	if ref, ok := schema["$ref"].(string); ok {
+		name, ok := strings.CutPrefix(ref, "#/$defs/")
+		if !ok {
+			return []string{"unsupported schema reference " + ref}
+		}
+		defs, _ := root["$defs"].(map[string]any)
+		d, ok := defs[name].(map[string]any)
+		if !ok {
+			return []string{"unresolved schema reference " + ref}
+		}
+		return validateSchema(root, d, val, path)
+	}
+	if types, ok := schema["type"].([]any); ok {
+		var choices []any
+		for _, typ := range types {
+			choices = append(choices, map[string]any{"type": typ})
+		}
+		return validateSchema(root, map[string]any{"anyOf": choices}, val, path)
+	}
 	var errs []string
 	if path == "" {
 		path = "$"
@@ -31,16 +54,16 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 
 	if requirements, ok := schema["allOf"].([]any); ok {
 		for _, candidate := range requirements {
-			errs = append(errs, validateAgainstSchema(candidate.(map[string]any), val, path)...)
+			errs = append(errs, validateSchema(root, candidate.(map[string]any), val, path)...)
 		}
 	}
-	if forbidden, ok := schema["not"].(map[string]any); ok && len(validateAgainstSchema(forbidden, val, path)) == 0 {
+	if forbidden, ok := schema["not"].(map[string]any); ok && len(validateSchema(root, forbidden, val, path)) == 0 {
 		errs = append(errs, fmt.Sprintf("%s: matched a forbidden schema", path))
 	}
 	if alternatives, ok := schema["anyOf"].([]any); ok {
 		matched := false
 		for _, candidate := range alternatives {
-			if len(validateAgainstSchema(candidate.(map[string]any), val, path)) == 0 {
+			if len(validateSchema(root, candidate.(map[string]any), val, path)) == 0 {
 				matched = true
 				break
 			}
@@ -67,6 +90,33 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 		}
 	}
 
+	if props, ok := schema["properties"].(map[string]any); ok && schema["type"] == nil {
+		if object, ok := val.(map[string]any); ok {
+			for key, rule := range props {
+				if value, present := object[key]; present {
+					errs = append(errs, validateSchema(root, rule.(map[string]any), value, path+"."+key)...)
+				}
+			}
+		}
+	}
+	if arr, ok := val.([]any); ok {
+		if minimum, ok := schema["minItems"].(float64); ok && len(arr) < int(minimum) {
+			errs = append(errs, path+": below minItems")
+		}
+		if maximum, ok := schema["maxItems"].(float64); ok && len(arr) > int(maximum) {
+			errs = append(errs, path+": above maxItems")
+		}
+		if unique, ok := schema["uniqueItems"].(bool); ok && unique {
+			seen := make(map[string]bool)
+			for _, v := range arr {
+				raw, _ := json.Marshal(v)
+				if seen[string(raw)] {
+					errs = append(errs, path+": duplicate item")
+				}
+				seen[string(raw)] = true
+			}
+		}
+	}
 	if reqs, ok := schema["required"].([]any); ok {
 		if object, ok := val.(map[string]any); ok {
 			for _, r := range reqs {
@@ -104,7 +154,7 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			}
 			for k, v := range m {
 				if pSchema, ok := props[k].(map[string]any); ok {
-					errs = append(errs, validateAgainstSchema(pSchema, v, path+"."+k)...)
+					errs = append(errs, validateSchema(root, pSchema, v, path+"."+k)...)
 				} else if !addlAllowed {
 					errs = append(errs, fmt.Sprintf("%s: unexpected property %q (additionalProperties=false)", path, k))
 				}
@@ -119,7 +169,7 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			}
 			if itemSchema, ok := schema["items"].(map[string]any); ok {
 				for i, item := range arr {
-					errs = append(errs, validateAgainstSchema(itemSchema, item, fmt.Sprintf("%s[%d]", path, i))...)
+					errs = append(errs, validateSchema(root, itemSchema, item, fmt.Sprintf("%s[%d]", path, i))...)
 				}
 			}
 		case "string":
@@ -129,6 +179,10 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			}
 			if ml, ok := schema["minLength"].(float64); ok && len(s) < int(ml) {
 				errs = append(errs, fmt.Sprintf("%s: string len %d < minLength %d", path, len(s), int(ml)))
+			}
+		case "null":
+			if val != nil {
+				errs = append(errs, path+": expected null")
 			}
 		case "boolean":
 			if _, ok := val.(bool); !ok {
@@ -203,6 +257,9 @@ func TestJSONSchemaConformanceAcrossConfigsPresetsLockAndReceipt(t *testing.T) {
 		filepath.Join(repoRoot, "internal", "presets", "base.yaml"),
 		filepath.Join(repoRoot, "internal", "presets", "app-ts.yaml"),
 		filepath.Join(repoRoot, "internal", "presets", "polyglot-native.yaml"),
+		filepath.Join(repoRoot, "internal", "presets", "base-1.1.0.yaml"),
+		filepath.Join(repoRoot, "internal", "presets", "app-ts-1.1.0.yaml"),
+		filepath.Join(repoRoot, "internal", "presets", "polyglot-native-1.1.0.yaml"),
 		filepath.Join(repoRoot, "examples", "app-ts", ".waypost.yaml"),
 		filepath.Join(repoRoot, "examples", "polyglot-native", ".waypost.yaml"),
 	}
@@ -358,11 +415,11 @@ checks: []
 	srv.Close()
 
 	// Step 3: verify --mode ci --frozen --offline --base <baseSHA> MUST read base:.waypost.lock,
-	// detect removal of org-base-check, enforce it from base floor, and pass offline!
+	// detect removal of org-base-check and block before execution, even offline.
 	out.Reset()
 	errBuf.Reset()
-	if code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--offline", "--base", baseSHA, "--format", "json"}, &out, &errBuf); code != 0 {
-		t.Fatalf("offline frozen CI verify failed (%d):\nstdout=%s\nstderr=%s", code, out.String(), errBuf.String())
+	if code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--offline", "--base", baseSHA, "--format", "json"}, &out, &errBuf); code != 1 {
+		t.Fatalf("offline CI did not block floor removal (%d):\nstdout=%s\nstderr=%s", code, out.String(), errBuf.String())
 	}
 	var rec verify.Receipt
 	if err := json.Unmarshal(out.Bytes(), &rec); err != nil {
@@ -586,10 +643,11 @@ components:
 	runGitCmd(t, repoDir, "commit", "-m", "base")
 	baseSHA := strings.TrimSpace(runGitOutput(t, repoDir, "rev-parse", "HEAD"))
 
-	// Clean base passes built-in waypost-boundaries check!
+	runGitCmd(t, repoDir, "commit", "--allow-empty", "-m", "check unchanged policy")
+	// Clean candidate passes the built-in boundary check.
 	out.Reset()
 	errBuf.Reset()
-	if code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--all", "--format", "json"}, &out, &errBuf); code != 0 {
+	if code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--base", baseSHA, "--all", "--format", "json"}, &out, &errBuf); code != 0 {
 		t.Fatalf("clean verify failed (%d): %s\n%s", code, errBuf.String(), out.String())
 	}
 	var cleanRec verify.Receipt
@@ -798,6 +856,68 @@ func TestRatchetBoundarySchemaConformance(t *testing.T) {
 			}
 			if tc.valid && (cfg.Boundaries.EffectiveMode() != "ratchet" || cfg.Boundaries.BaselinePath() != tc.path) {
 				t.Fatalf("unexpected effective baseline config: %+v", cfg.Boundaries)
+			}
+		})
+	}
+}
+
+func TestReadCommandSchemaConformance(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-b", "main")
+	mustWriteFile(t, filepath.Join(dir, "app/main.ts"), "export const value = 1;\n")
+	mustWriteFile(t, filepath.Join(dir, "app/main.test.ts"), "// behavioral seam\n")
+	mustWriteFile(t, filepath.Join(dir, "package.json"), `{"name":"demo","version":"1.0.0"}`)
+	mustWriteFile(t, filepath.Join(dir, config.ConfigFileName), `schema_version: "1"
+extends: builtin:base@1.1.0
+components:
+  - {id: app, root: app, checks: [check-app]}
+checks:
+  - id: check-app
+    command: echo full
+    local_command: echo local
+    serial: false
+    paths: [app/**]
+rules:
+  - id: app-invariant
+    kind: invariant
+    summary: The app is covered.
+    reason: Behavioral changes need proof.
+    verified_by:
+      checks: [check-app]
+      tests: [app/*.test.ts]
+pins:
+  - id: package
+    contract_id: demo
+    role: producer
+    producer: example/demo
+    consumer: example/app
+    artifact: demo
+    version: 1.0.0
+    source: {kind: npm-package-version, manifest: package.json}
+`)
+	mustGit(t, dir, "add", ".")
+	mustGit(t, dir, "commit", "-m", "feat(app): adopt policy")
+	for _, test := range []struct {
+		schema, command string
+		args            []string
+	}{
+		{"spec", "spec", []string{"--ref", "HEAD", "--history"}},
+		{"history", "history", []string{"--limit", "0"}},
+		{"pins", "pins", []string{"--repo", dir + "@HEAD"}},
+	} {
+		t.Run(test.schema, func(t *testing.T) {
+			var std, stderr bytes.Buffer
+			args := append([]string{test.command, "--dir", dir, "--format", "json"}, test.args...)
+			if code := Run(args, &std, &stderr); code != 0 {
+				t.Fatalf("%v exited %d: %s", args, code, stderr.String())
+			}
+			var payload any
+			if err := json.Unmarshal(std.Bytes(), &payload); err != nil {
+				t.Fatalf("%v: %s", err, std.String())
+			}
+			schema := loadJSONSchema(t, filepath.Join("..", "..", "schemas", test.schema+".v1.schema.json"))
+			if problems := validateAgainstSchema(schema, payload, ""); len(problems) > 0 {
+				t.Fatalf("schema violations: %v\n%s", problems, std.String())
 			}
 		})
 	}

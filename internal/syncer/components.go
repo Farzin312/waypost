@@ -1,22 +1,19 @@
 package syncer
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path"
 	"slices"
 	"strings"
-	"unicode"
 
 	"github.com/Farzin312/waypost/internal/archgraph"
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/lockfile"
+	"github.com/Farzin312/waypost/internal/repoview"
 )
 
-func (s *inspection) inspectComponents(repo string, cfg *config.Config, cm *compmap.Map) error {
+func (s *inspection) inspectComponents(cfg *config.Config, cm *compmap.Map) error {
 	if len(cfg.Components) == 0 {
 		return nil
 	}
@@ -27,7 +24,7 @@ func (s *inspection) inspectComponents(repo string, cfg *config.Config, cm *comp
 		used[c.ID], roots[path.Clean(c.Root)] = true, true
 		catchAll = catchAll || slices.Contains(c.Paths, "**") || slices.Contains(c.Paths, "**/*")
 	}
-	if err := s.inspectMissingRoots(repo, cfg, cm); err != nil {
+	if err := s.inspectMissingRoots(cfg, cm); err != nil {
 		return err
 	}
 	if catchAll {
@@ -38,16 +35,16 @@ func (s *inspection) inspectComponents(repo string, cfg *config.Config, cm *comp
 		ignore = cfg.Boundaries.IgnorePaths
 	}
 	dirs := make(map[string]string)
-	err := archgraph.WalkSourceFiles(repo, cm, ignore, func(rel, language string) {
-		if len(cm.OwnersOf(rel)) == 0 {
-			dir := path.Dir(rel)
-			if dirs[dir] == "" || (dirs[dir] == "javascript" && language == "typescript") {
-				dirs[dir] = language
-			}
+	ignoreGlobs := compmap.CompileGlobs(ignore)
+	for rel, file := range s.view.Files {
+		language := archgraph.SourceLanguage(rel)
+		if !file.Regular() || language == "" || compmap.MatchCompiled(ignoreGlobs, rel) || len(cm.OwnersOf(rel)) > 0 {
+			continue
 		}
-	})
-	if err != nil {
-		return err
+		dir := path.Dir(rel)
+		if dirs[dir] == "" || language == "typescript" || dirs[dir] != "typescript" && language < dirs[dir] {
+			dirs[dir] = language
+		}
 	}
 	for _, rel := range sortedKeys(dirs) {
 		hint := applyHint
@@ -62,64 +59,34 @@ func (s *inspection) inspectComponents(repo string, cfg *config.Config, cm *comp
 	return nil
 }
 
-func (s *inspection) inspectMissingRoots(repo string, cfg *config.Config, cm *compmap.Map) error {
-	root, err := os.OpenRoot(repo)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-
-	var missing []compmap.Component
-	for _, c := range cm.Components {
-		if c.Provenance != compmap.ProvenanceDeclared || c.Root == "." || c.Root == "**" {
-			continue
-		}
-		info, err := root.Stat(c.Root)
-		switch {
-		case err == nil && (info.IsDir() || info.Mode().IsRegular()):
-			continue
-		case err != nil && !errors.Is(err, fs.ErrNotExist):
-			return fmt.Errorf("stat component %q: %w", c.ID, err)
-		}
-		missing = append(missing, c)
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-
-	// Include assets and links in the project inventory without following
-	// links or limiting ownership to languages the architecture scanner reads.
-	live := make(map[string]bool, len(missing))
+func (s *inspection) inspectMissingRoots(cfg *config.Config, cm *compmap.Map) error {
+	roots := make(map[string]bool)
 	hasProjectFiles := false
-	err = fs.WalkDir(root.FS(), ".", func(rel string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if rel == ".git" {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() || !(entry.Type().IsRegular() || entry.Type()&fs.ModeSymlink != 0) {
-			return nil
+	for rel := range s.view.Files {
+		roots[rel] = true
+		for dir := path.Dir(rel); dir != "." && !roots[dir]; dir = path.Dir(dir) {
+			roots[dir] = true
 		}
 		if rel != config.ConfigFileName && rel != config.LocalConfigFileName && rel != lockfile.LockFileName &&
 			rel != cfg.Boundaries.BaselinePath() && !strings.HasPrefix(rel, ".waypost/") {
 			hasProjectFiles = true
 		}
-		for _, c := range missing {
-			if !live[c.ID] && compmap.MatchAnyGlob(c.Paths, rel) {
+	}
+	var missing []compmap.Component
+	for _, c := range cm.Components {
+		if c.Provenance == compmap.ProvenanceDeclared && c.Root != "." && c.Root != "**" && !roots[c.Root] {
+			missing = append(missing, c)
+		}
+	}
+	live := make(map[string]bool)
+	for _, c := range missing {
+		globs := compmap.CompileGlobs(c.Paths)
+		for rel := range s.view.Files {
+			if compmap.MatchCompiled(globs, rel) {
 				live[c.ID] = true
+				break
 			}
 		}
-		if len(live) == len(missing) {
-			return fs.SkipAll
-		}
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 	for _, c := range missing {
 		if live[c.ID] {
@@ -147,7 +114,7 @@ func (s *inspection) inspectMissingRoots(repo string, cfg *config.Config, cm *co
 func componentID(rel string, used map[string]bool) string {
 	slug := func(text string) string {
 		return strings.Join(strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+			return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
 		}), "-")
 	}
 	id := slug(path.Base(rel))
@@ -177,7 +144,7 @@ func componentReferenced(cfg *config.Config, id string) bool {
 		}
 	}
 	for _, pin := range cfg.Pins {
-		if pin.Consumer == id {
+		if pin.Consumer == id || pin.ConsumerComponent == id {
 			return true
 		}
 	}
@@ -197,12 +164,12 @@ func componentReferenced(cfg *config.Config, id string) bool {
 	return false
 }
 
-func inferDependencies(repo string, cfg config.Config, additions map[string]config.ComponentConfig) error {
-	cm, err := compmap.Build(repo, &cfg, nil)
+func inferDependencies(view *repoview.View, cfg config.Config, additions map[string]config.ComponentConfig) error {
+	cm, err := compmap.BuildWithOptions(view.Repo, &cfg, nil, compmap.BuildOptions{View: view})
 	if err != nil {
 		return err
 	}
-	report, err := archgraph.AnalyzeLive(repo, cm, cfg.Boundaries, archgraph.AnalyzeOptions{SkipNonRegularFiles: true})
+	report, err := archgraph.AnalyzeLive(view.Repo, cm, cfg.Boundaries, archgraph.AnalyzeOptions{View: view, SkipNonRegularFiles: true})
 	if err != nil {
 		return err
 	}

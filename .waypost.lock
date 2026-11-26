@@ -2,10 +2,10 @@
 lock_version: "1"
 schema_version: "1"
 resolver_version: "1"
-config_sha256: d596ec83c8bdfba43c44d203795a307ab9cdbdeb18e41b575ac419063dec6f49
-policy_digest: e67810d9f8ada2286a5098f1ac052316790d9545e02d39253b4ad0a97621f19d
+config_sha256: 926b301cf9a9ba3a3093358c5a3c856cfa996c3376d3f17088eab8e1ba3fc947
+policy_digest: 19c9addb5b86ce320e1d2fc756ace648389af41876bb42092700393a61ebd114
 chain:
-    - ref: builtin:base@1.0.0
+    - ref: builtin:base@1.1.0
       source: builtin
-      version: 1.0.0
-      sha256: bea6c9e841864f66a22aca5675497df75f6a98c82ff07bb753f045abb376c333
+      version: 1.1.0
+      sha256: 1f6b643b4d68710908e839144300d678ea0c78d2edf51b7a99979ea1c7d87a45

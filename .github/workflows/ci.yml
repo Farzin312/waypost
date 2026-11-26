@@ -5,6 +5,10 @@ on:
     branches: ["main"]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -12,22 +16,29 @@ jobs:
   test-and-dogfood:
     name: Test, Cross-Compile & Dogfood
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout (full history for base policy floor)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
-      - name: Go vet
-        run: go vet ./...
-
-      - name: Go test (-race)
-        run: go test -race -v ./...
+      - name: Build verifier and check drift before product checks
+        env:
+          CGO_ENABLED: "0"
+          GOENV: "off"
+          GOWORK: "off"
+          GOFLAGS: ""
+          GOTOOLCHAIN: local
+        run: |
+          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/waypost" ./cmd/waypost
+          "$RUNNER_TEMP/waypost" sync --check --offline --ref HEAD
 
       - name: Cross-compile pure Go (CGO_ENABLED=0)
         run: |
@@ -37,21 +48,24 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/waypost-windows-amd64.exe ./cmd/waypost
           ls -lh dist/
 
-      - name: Dogfood waypost verify (CI authority + frozen lock)
+      - name: Dogfood waypost verify
+        env:
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          ARGS=(verify --mode ci --frozen --receipt .waypost/receipt.v1.json --markdown .waypost/receipt.md)
-          if [ -n "${GITHUB_BASE_REF:-}" ]; then
-            ARGS+=(--base "origin/${GITHUB_BASE_REF}")
-          else
-            ARGS+=(--all)
+          "$RUNNER_TEMP/waypost" verify --mode ci --frozen --offline --base "$EVENT_BASE" --all \
+            --receipt "$RUNNER_TEMP/receipt.v1.json" --markdown "$RUNNER_TEMP/receipt.md"
+
+      - name: Publish verification summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/receipt.md" ]]; then
+            cat "$RUNNER_TEMP/receipt.md" >> "$GITHUB_STEP_SUMMARY"
           fi
-          go run ./cmd/waypost "${ARGS[@]}"
-          cat .waypost/receipt.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload verification receipt
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: waypost-receipt
-          path: .waypost/receipt.v1.json
+          path: ${{ runner.temp }}/receipt.v1.json
           if-no-files-found: ignore

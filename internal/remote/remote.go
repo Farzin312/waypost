@@ -135,6 +135,15 @@ func IsValidSHA256Hex(s string) bool {
 // expectedSHA256 is known. When expectedSHA256 is non-empty, downloaded or cached
 // bytes MUST match byte-for-byte or Fetch fails closed.
 func Fetch(ref, expectedSHA256 string, offline bool) (*Result, error) {
+	return fetch(ref, expectedSHA256, offline, true)
+}
+
+// FetchReadOnly verifies downloaded or cached bytes without updating the cache.
+func FetchReadOnly(ref, expectedSHA256 string, offline bool) (*Result, error) {
+	return fetch(ref, expectedSHA256, offline, false)
+}
+
+func fetch(ref, expectedSHA256 string, offline, updateCache bool) (*Result, error) {
 	resolvedURL, err := ResolveURL(ref)
 	if err != nil {
 		return nil, err
@@ -148,7 +157,7 @@ func Fetch(ref, expectedSHA256 string, offline bool) (*Result, error) {
 	cacheDir := CacheDir()
 	if expectedSHA256 != "" {
 		cachePath := filepath.Join(cacheDir, expectedSHA256+".yaml")
-		if raw, err := os.ReadFile(cachePath); err == nil {
+		if raw, err := readCache(cachePath); err == nil {
 			actual := sha256Hex(raw)
 			if actual == expectedSHA256 {
 				return &Result{
@@ -199,19 +208,21 @@ func Fetch(ref, expectedSHA256 string, offline bool) (*Result, error) {
 	}
 
 	// Best-effort atomic write to local content-addressed cache.
-	if err := os.MkdirAll(cacheDir, 0o755); err == nil {
-		if f, err := os.CreateTemp(cacheDir, ".preset-*.tmp"); err == nil {
-			tmpName := f.Name()
-			if _, wErr := f.Write(raw); wErr == nil {
-				_ = f.Close()
-				_ = os.Rename(tmpName, filepath.Join(cacheDir, actual+".yaml"))
-			} else {
-				_ = f.Close()
-				_ = os.Remove(tmpName)
+	if updateCache {
+		if err := os.MkdirAll(cacheDir, 0o755); err == nil {
+			if f, err := os.CreateTemp(cacheDir, ".preset-*.tmp"); err == nil {
+				tmpName := f.Name()
+				if _, wErr := f.Write(raw); wErr == nil {
+					_ = f.Close()
+					_ = os.Rename(tmpName, filepath.Join(cacheDir, actual+".yaml"))
+				} else {
+					_ = f.Close()
+					_ = os.Remove(tmpName)
+				}
 			}
 		}
-	}
 
+	}
 	return &Result{
 		Ref:       ref,
 		URL:       resolvedURL,
@@ -288,4 +299,28 @@ func isDisallowedIP(ip net.IP) bool {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+func readCache(filename string) ([]byte, error) {
+	info, err := os.Lstat(filename)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxPresetBytes {
+		return nil, fmt.Errorf("invalid cached preset file")
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return nil, fmt.Errorf("cached preset changed while opening")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxPresetBytes+1))
+	if len(raw) > maxPresetBytes {
+		return nil, fmt.Errorf("cached preset exceeds %d bytes", maxPresetBytes)
+	}
+	return raw, err
 }
