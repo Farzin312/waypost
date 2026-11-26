@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Farzin312/waypost/internal/config"
+	"github.com/Farzin312/waypost/internal/shellcmd"
 )
 
 // Provenance labels how a component or dependency edge was discovered.
@@ -25,11 +27,7 @@ const (
 
 // BuildOptions controls optional external provider execution during component map construction.
 type BuildOptions struct {
-	// AllowProviders must be true (after lock/policy validation) for any authorized
-	// external provider to execute. Defaults to false (safe read-only static inference).
-	AllowProviders bool
-	// AllowedProviderCommands optionally restricts execution in CI mode to exact
-	// provider ID -> command pairs approved by the trusted base policy.
+	AllowProviders          bool
 	AllowedProviderCommands map[string]string
 }
 
@@ -59,10 +57,11 @@ type ProviderStatus struct {
 	Note       string `json:"note"`
 }
 
-// Map is the complete component map for a repository.
+// Map is the complete component map and ecosystem inventory for a repository.
 type Map struct {
 	Components       []Component           `json:"components"`
 	Pins             []config.CrossRepoPin `json:"pins,omitempty"`
+	Ecosystem        EcosystemInfo         `json:"ecosystem"`
 	UnmappedPaths    []string              `json:"unmapped_paths,omitempty"`
 	CoverageGaps     []string              `json:"coverage_gaps,omitempty"`
 	ProviderStatuses []ProviderStatus      `json:"provider_statuses,omitempty"`
@@ -94,21 +93,28 @@ var skipDirs = map[string]bool{
 	"target":           true,
 }
 
-// Build constructs a Component Map with safe defaults (providers disabled unless BuildWithOptions enables them).
+// Build constructs a Component Map with safe defaults (providers disabled).
 func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, error) {
 	return BuildWithOptions(repoDir, cfg, trackedFiles, BuildOptions{})
 }
 
 // BuildWithOptions constructs a Component Map by combining:
-// 1. Safe static manifest inference (no repo code execution),
-// 2. Declared components and pins from effective .waypost.yaml (authoritative overlay),
-// 3. Optional authorized external providers ONLY when opts.AllowProviders is true,
-// 4. Reverse-dependency graph ("what builds on what") and coverage-gap audit.
+// 1. Safe static manifest inference (zero code execution),
+// 2. Native read-only `.bounds/manifests/*.yaml` subsystem graphs when present (tool-observed),
+// 3. Declared components & pins from effective .waypost.yaml (authoritative overlay),
+// 4. Optional authorized external providers ONLY when opts.AllowProviders is true,
+// 5. Reverse-dependency graph ("what builds on what"), cycle detection, ecosystem scan, and coverage audit.
 func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string, opts BuildOptions) (*Map, error) {
-	inferred, gaps, err := inferManifests(repoDir)
+	absRepo, err := filepath.Abs(repoDir)
 	if err != nil {
 		return nil, err
 	}
+
+	inferred, gaps, err := inferManifests(absRepo)
+	if err != nil {
+		return nil, err
+	}
+	eco := inspectEcosystem(absRepo)
 
 	byID := make(map[string]Component)
 	byRoot := make(map[string]string)
@@ -118,7 +124,16 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 		byRoot[normalizeRoot(c.Root)] = c.ID
 	}
 
-	// Overlay declared components (declared metadata wins over inferred).
+	// Merge static `.bounds/manifests/*.yaml` subsystems as tool-observed (zero execution!).
+	if boundsComps, ok := loadBoundsManifests(absRepo); ok {
+		for _, bc := range boundsComps {
+			normRoot := normalizeRoot(bc.Root)
+			byID[bc.ID] = bc
+			byRoot[normRoot] = bc.ID
+		}
+	}
+
+	// Overlay declared components (declared metadata wins over inferred/tool-observed).
 	if cfg != nil {
 		gaps = append(gaps, cfg.CoverageGaps...)
 		for _, dc := range cfg.Components {
@@ -155,6 +170,9 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 				if comp.Language == "" {
 					comp.Language = prev.Language
 				}
+				if len(comp.DependsOn) == 0 {
+					comp.DependsOn = prev.DependsOn
+				}
 			}
 			if len(comp.Paths) == 0 {
 				comp.Paths = defaultPathsForRoot(normRoot)
@@ -164,11 +182,11 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 		}
 	}
 
-	// Optional external providers (ONLY when authorized AND explicitly allowed after lock/policy checks).
+	// Optional external providers (ONLY when authorized AND explicitly allowed).
 	var provStatuses []ProviderStatus
 	if cfg != nil {
 		for _, p := range cfg.Providers {
-			ps := runProviderIfAuthorized(repoDir, p, opts, byID)
+			ps := runProviderIfAuthorized(absRepo, p, opts, byID)
 			provStatuses = append(provStatuses, ps)
 		}
 	}
@@ -188,8 +206,15 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 	}
 	sort.Slice(comps, func(i, j int) bool { return comps[i].ID < comps[j].ID })
 
+	// Detect cycles in component dependency graph and report transparently.
+	gaps = append(gaps, detectComponentCycles(comps)...)
+	if len(eco.DuplicateSkillPaths) > 0 {
+		gaps = append(gaps, fmt.Sprintf("duplicate non-symlink skill directories found in .claude/skills/ (%d paths) alongside .agents/skills/; consolidate to a single source of truth", len(eco.DuplicateSkillPaths)))
+	}
+
 	m := &Map{
 		Components:       comps,
+		Ecosystem:        eco,
 		CoverageGaps:     uniqueSorted(gaps),
 		ProviderStatuses: provStatuses,
 	}
@@ -217,19 +242,24 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 func (m *Map) OwnersOf(relPath string) []string {
 	relPath = strings.TrimPrefix(filepath.ToSlash(relPath), "./")
 	var exactMatches []Component
-	var rootCatchAll []Component
+	var declaredRootCatchAll []Component
+	var inferredRootCatchAll []Component
 	for _, c := range m.Components {
 		if MatchAnyGlob(c.Paths, relPath) {
 			if c.Root == "." && len(c.Paths) == 1 && c.Paths[0] == "**" {
-				rootCatchAll = append(rootCatchAll, c)
+				if c.Provenance == ProvenanceDeclared {
+					declaredRootCatchAll = append(declaredRootCatchAll, c)
+				} else {
+					inferredRootCatchAll = append(inferredRootCatchAll, c)
+				}
 			} else {
 				exactMatches = append(exactMatches, c)
 			}
 		}
 	}
-	chosen := exactMatches
+	chosen := append(declaredRootCatchAll, exactMatches...)
 	if len(chosen) == 0 {
-		chosen = rootCatchAll
+		chosen = inferredRootCatchAll
 	}
 	ids := make([]string, 0, len(chosen))
 	for _, c := range chosen {
@@ -299,23 +329,20 @@ func (m *Map) ImpactedByPaths(changedPaths []string) Impact {
 }
 
 type inferredItem struct {
-	comp       Component
-	nodePkg    string
-	nodeDeps   []string
+	comp      Component
+	nodePkg   string
+	nodeDeps  []string
+	localDeps []string // relative repo root dirs (from go.mod replace or Cargo.toml path)
 }
 
-// inferManifests walks repoDir safely (read-only, max depth 4) and extracts
+// inferManifests walks absRepo safely (read-only, max depth 4) and extracts
 // manifest-level components without executing any repository code.
-func inferManifests(repoDir string) ([]Component, []string, error) {
+func inferManifests(absRepo string) ([]Component, []string, error) {
 	var items []inferredItem
 	var gaps []string
+	rootsWithManifest := make(map[string]bool)
 
-	absRepo, err := filepath.Abs(repoDir)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	err = filepath.WalkDir(absRepo, func(p string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(absRepo, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
@@ -340,17 +367,24 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 
 		switch {
 		case base == "go.mod":
-			items = append(items, inferredItem{comp: parseGoMod(p, absRepo, dirRel, rel)})
+			c, localDeps := parseGoMod(p, absRepo, dirRel, rel)
+			items = append(items, inferredItem{comp: c, localDeps: localDeps})
+			rootsWithManifest[dirRel] = true
 		case base == "package.json":
 			c, pkgName, deps := parsePackageJSON(p, dirRel, rel)
 			items = append(items, inferredItem{comp: c, nodePkg: pkgName, nodeDeps: deps})
+			rootsWithManifest[dirRel] = true
 		case base == "Cargo.toml":
-			items = append(items, inferredItem{comp: parseCargoToml(p, dirRel, rel)})
+			c, localDeps := parseCargoToml(p, dirRel, rel)
+			items = append(items, inferredItem{comp: c, localDeps: localDeps})
+			rootsWithManifest[dirRel] = true
 		case base == "pyproject.toml":
 			items = append(items, inferredItem{comp: parsePyprojectToml(p, dirRel, rel)})
+			rootsWithManifest[dirRel] = true
 		case strings.HasSuffix(base, ".uproject"):
 			c, gap := parseUProject(p, dirRel, rel)
 			items = append(items, inferredItem{comp: c})
+			rootsWithManifest[dirRel] = true
 			if gap != "" {
 				gaps = append(gaps, gap)
 			}
@@ -361,10 +395,46 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 		return nil, nil, err
 	}
 
-	// Assign final deduplicated IDs BEFORE wiring intra-repo Node package dependencies
-	// so two manifests sharing a name (e.g. Cargo crate + package.json) never collide.
+	// Detect Python validator/tooling directories (`tools/`, `scripts/`) containing `*.py`
+	// when no pyproject.toml is present (common in game/native/scientific repos).
+	for _, candDir := range []string{"tools", "scripts"} {
+		if rootsWithManifest[candDir] {
+			continue
+		}
+		fullDir := filepath.Join(absRepo, candDir)
+		entries, err := os.ReadDir(fullDir)
+		if err != nil {
+			continue
+		}
+		pyCount := 0
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".py") {
+				pyCount++
+			}
+		}
+		if pyCount > 0 {
+			items = append(items, inferredItem{
+				comp: Component{
+					ID:          candDir + "-python",
+					Root:        candDir,
+					Kind:        "python-tooling",
+					Language:    "python",
+					Description: fmt.Sprintf("Python scripts/validators in %s/ (%d top-level .py files)", candDir, pyCount),
+					Paths:       []string{candDir + "/**"},
+					Provenance:  ProvenanceInferred,
+				},
+			})
+		}
+	}
+
+	// Assign final deduplicated IDs BEFORE wiring intra-repo dependencies.
+	type rootLangKey struct {
+		root string
+		lang string
+	}
 	usedIDs := make(map[string]bool, len(items))
 	pkgNameToID := make(map[string]string)
+	rootLangToID := make(map[rootLangKey]string)
 	for i := range items {
 		id := items[i].comp.ID
 		if usedIDs[id] {
@@ -385,6 +455,10 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 		if items[i].nodePkg != "" {
 			pkgNameToID[items[i].nodePkg] = id
 		}
+		rlk := rootLangKey{root: normalizeRoot(items[i].comp.Root), lang: items[i].comp.Language}
+		if _, exists := rootLangToID[rlk]; !exists {
+			rootLangToID[rlk] = id
+		}
 	}
 
 	comps := make([]Component, 0, len(items))
@@ -395,25 +469,66 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 					items[i].comp.DependsOn = append(items[i].comp.DependsOn, targetID)
 				}
 			}
-			items[i].comp.DependsOn = uniqueSorted(items[i].comp.DependsOn)
 		}
+		if len(items[i].localDeps) > 0 {
+			for _, depRoot := range items[i].localDeps {
+				rlk := rootLangKey{root: normalizeRoot(depRoot), lang: items[i].comp.Language}
+				if targetID, exists := rootLangToID[rlk]; exists && targetID != items[i].comp.ID {
+					items[i].comp.DependsOn = append(items[i].comp.DependsOn, targetID)
+				}
+			}
+		}
+		items[i].comp.DependsOn = uniqueSorted(items[i].comp.DependsOn)
 		comps = append(comps, items[i].comp)
 	}
 
 	return comps, gaps, nil
 }
 
-func parseGoMod(fullPath, repoRoot, dirRel, rel string) Component {
+func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
 	modName := ""
+	var localDeps []string
 	f, err := os.Open(fullPath)
 	if err == nil {
 		defer f.Close()
 		sc := bufio.NewScanner(f)
+		inReplace := false
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
+			if idx := strings.Index(line, "//"); idx >= 0 {
+				line = strings.TrimSpace(line[:idx])
+			}
+			if line == "" {
+				continue
+			}
 			if strings.HasPrefix(line, "module ") {
 				modName = strings.TrimSpace(strings.TrimPrefix(line, "module "))
-				break
+			} else if strings.HasPrefix(line, "replace (") {
+				inReplace = true
+			} else if inReplace && line == ")" {
+				inReplace = false
+			} else if inReplace || strings.HasPrefix(line, "replace ") {
+				spec := strings.TrimPrefix(line, "replace ")
+				if parts := strings.Split(spec, "=>"); len(parts) == 2 {
+					rhs := strings.TrimSpace(parts[1])
+					fields := strings.Fields(rhs)
+					if len(fields) >= 1 {
+						target := strings.Trim(fields[0], `"`)
+						if strings.HasPrefix(target, "./") || strings.HasPrefix(target, "../") {
+							joined := filepath.ToSlash(filepath.Clean(filepath.Join(dirRel, target)))
+							if !strings.HasPrefix(joined, "../") && joined != ".." {
+								localDeps = append(localDeps, joined)
+							}
+						} else if filepath.IsAbs(target) {
+							if relTarget, err := filepath.Rel(repoRoot, target); err == nil {
+								relSlash := filepath.ToSlash(filepath.Clean(relTarget))
+								if !strings.HasPrefix(relSlash, "../") && relSlash != ".." {
+									localDeps = append(localDeps, relSlash)
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -441,7 +556,7 @@ func parseGoMod(fullPath, repoRoot, dirRel, rel string) Component {
 		Paths:        defaultPathsForRoot(dirRel),
 		ManifestFile: rel,
 		Provenance:   ProvenanceInferred,
-	}
+	}, localDeps
 }
 
 func parsePackageJSON(fullPath, dirRel, rel string) (Component, string, []string) {
@@ -486,8 +601,55 @@ func parsePackageJSON(fullPath, dirRel, rel string) (Component, string, []string
 	}, pj.Name, allDeps
 }
 
-func parseCargoToml(fullPath, dirRel, rel string) Component {
+var cargoPathDepRE = regexp.MustCompile(`\bpath\s*=\s*(?:"([^"]+)"|'([^']+)')`)
+
+func isCargoDepSection(section string) bool {
+	s := strings.TrimSpace(section)
+	if s == "dependencies" || s == "dev-dependencies" || s == "build-dependencies" || s == "workspace.dependencies" {
+		return true
+	}
+	return strings.HasSuffix(s, ".dependencies") || strings.HasSuffix(s, ".dev-dependencies") || strings.HasSuffix(s, ".build-dependencies") ||
+		strings.HasPrefix(s, "dependencies.") || strings.HasPrefix(s, "dev-dependencies.") || strings.HasPrefix(s, "build-dependencies.")
+}
+
+func parseCargoToml(fullPath, dirRel, rel string) (Component, []string) {
 	name := extractTomlName(fullPath)
+	var localDeps []string
+	if f, err := os.Open(fullPath); err == nil {
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		inDepSection := false
+		for sc.Scan() {
+			line := sc.Text()
+			if idx := strings.IndexByte(line, '#'); idx >= 0 {
+				line = line[:idx]
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+				sec := strings.Trim(trimmed, "[]")
+				inDepSection = isCargoDepSection(sec)
+				continue
+			}
+			if !inDepSection {
+				continue
+			}
+			for _, m := range cargoPathDepRE.FindAllStringSubmatch(trimmed, -1) {
+				depPath := m[1]
+				if depPath == "" {
+					depPath = m[2]
+				}
+				if depPath != "" {
+					joined := filepath.ToSlash(filepath.Clean(filepath.Join(dirRel, depPath)))
+					if !strings.HasPrefix(joined, "../") && joined != ".." {
+						localDeps = append(localDeps, joined)
+					}
+				}
+			}
+		}
+	}
 	return Component{
 		ID:           slugFromRootOrName(dirRel, name, "rust-crate"),
 		Root:         dirRel,
@@ -497,7 +659,7 @@ func parseCargoToml(fullPath, dirRel, rel string) Component {
 		Paths:        defaultPathsForRoot(dirRel),
 		ManifestFile: rel,
 		Provenance:   ProvenanceInferred,
-	}
+	}, localDeps
 }
 
 func parsePyprojectToml(fullPath, dirRel, rel string) Component {
@@ -569,8 +731,6 @@ func extractTomlName(fullPath string) string {
 	return ""
 }
 
-// runProviderIfAuthorized executes an external read-only architecture provider ONLY
-// when explicitly authorized in config AND allowed by verified lock/policy options.
 func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, opts BuildOptions, byID map[string]Component) ProviderStatus {
 	ps := ProviderStatus{
 		ID:         p.ID,
@@ -600,7 +760,7 @@ func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, opts Build
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", p.Command)
+	cmd := shellcmd.CommandContext(ctx, p.Command)
 	cmd.Dir = repoDir
 	out, err := cmd.Output()
 	if err != nil {

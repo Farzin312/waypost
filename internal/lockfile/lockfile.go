@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Farzin312/waypost/internal/config"
+	"github.com/Farzin312/waypost/internal/remote"
 	"github.com/Farzin312/waypost/internal/version"
 	"gopkg.in/yaml.v3"
 )
@@ -236,4 +237,31 @@ func shortHash(h string) string {
 		return h[:12]
 	}
 	return h
+}
+
+// ParseBytes unmarshals a lockfile from raw YAML bytes.
+func ParseBytes(b []byte) (*Lockfile, string, error) {
+	var lf Lockfile
+	dec := yaml.NewDecoder(strings.NewReader(string(b)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&lf); err != nil {
+		return nil, "", fmt.Errorf("parse lockfile: %w", err)
+	}
+	return &lf, sha256Hex(b), nil
+}
+
+// PinnedRemoteSHAs returns a map of remote ancestor refs to their locked SHA-256 digests.
+func PinnedRemoteSHAs(lf *Lockfile) map[string]string {
+	if lf == nil {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, step := range lf.Chain {
+		ref := strings.TrimSpace(step.Ref)
+		sha := strings.ToLower(strings.TrimSpace(step.SHA256))
+		if step.Source == "remote" && ref != "" && remote.IsValidSHA256Hex(sha) {
+			out[ref] = sha
+		}
+	}
+	return out
 }

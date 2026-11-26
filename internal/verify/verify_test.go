@@ -62,3 +62,54 @@ checks:
 		t.Fatalf("unexpected counts: %+v", rec.Summary)
 	}
 }
+
+func TestCappedBufferBoundsMemoryAndRetainsHeadAndTail(t *testing.T) {
+	buf := newCappedBuffer(1024)
+	_, _ = buf.Write([]byte("HEAD_MARKER_START\n"))
+	chunk := make([]byte, 4096)
+	for i := range chunk {
+		chunk[i] = 'x'
+	}
+	for i := 0; i < 64; i++ {
+		_, _ = buf.Write(chunk)
+	}
+	_, _ = buf.Write([]byte("\nTAIL_FAILURE_SUMMARY: AssertionError\n"))
+
+	out := buf.String()
+	if len(out) > 1200 {
+		t.Fatalf("expected cappedBuffer output to stay bounded near 1024 bytes, got %d", len(out))
+	}
+	if !strings.Contains(out, "HEAD_MARKER_START") {
+		t.Fatal("expected head marker to be preserved")
+	}
+	if !strings.Contains(out, "TAIL_FAILURE_SUMMARY: AssertionError") {
+		t.Fatal("expected trailing failure summary to be preserved")
+	}
+	if !strings.Contains(out, "bytes omitted") {
+		t.Fatal("expected omission marker")
+	}
+
+	excerpt := RedactAndTrim("HEAD_INFO\n"+strings.Repeat("a", 500)+"TOKEN=supersecret12345678\nFINAL_ERROR_LINE", 120)
+	if strings.Contains(excerpt, "supersecret12345678") {
+		t.Fatal("secret leaked in trimmed excerpt")
+	}
+	if !strings.Contains(excerpt, "FINAL_ERROR_LINE") {
+		t.Fatalf("expected trailing error line to be preserved in excerpt: %q", excerpt)
+	}
+}
+
+func TestRedactQuotedSecretsAndPaddedBearerTokens(t *testing.T) {
+	raw := `Authorization: Bearer dG9rZW4xMjM0NTY3ODkw==
+API_TOKEN="quoted-super-secret-value"
+DB_PASSWORD='single-quoted-secret'
+`
+	out := RedactAndTrim(raw, 500)
+	for _, leaked := range []string{"dG9rZW4xMjM0NTY3ODkw", "quoted-super-secret-value", "single-quoted-secret"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("secret %q leaked in redacted output:\n%s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "Bearer [REDACTED]") {
+		t.Fatalf("expected Bearer [REDACTED] in output:\n%s", out)
+	}
+}

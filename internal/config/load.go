@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Farzin312/waypost/internal/presets"
+	"github.com/Farzin312/waypost/internal/remote"
 	"github.com/Farzin312/waypost/internal/version"
 	"gopkg.in/yaml.v3"
 )
@@ -31,9 +32,15 @@ type LoadOptions struct {
 	OverrideRootRaw []byte
 	// OverrideLabel is used in error messages when OverrideRootRaw is set.
 	OverrideLabel string
-	// RepoFileReader, when non-nil, reads file-based `extends` ancestors from that trusted reader
+	// RepoFileReader, when non-nil, reads in-repo file-based `extends` ancestors from that trusted reader
 	// (e.g. `git show <baseTip>:<relPath>`) instead of the live worktree.
 	RepoFileReader ReadRepoFileFunc
+	// PinnedRemoteSHAs maps remote `extends` refs to their expected SHA-256 digests from .waypost.lock.
+	PinnedRemoteSHAs map[string]string
+	// RequirePinnedRemote fails closed if a remote `extends` ref is not present in PinnedRemoteSHAs.
+	RequirePinnedRemote bool
+	// Offline restricts remote preset resolution to the verified local content-addressed cache.
+	Offline bool
 }
 
 // ParseBytes unmarshals and validates a single config YAML document.
@@ -51,8 +58,8 @@ func ParseBytes(raw []byte, label string) (*Config, error) {
 }
 
 // Load resolves <repoDir>/.waypost.yaml (or OverrideRootRaw), walks its single-parent
-// `extends` chain, optionally merges .waypost.local.yaml in local mode, and computes
-// a deterministic effective policy digest.
+// `extends` chain (builtin, local file, or SHA-256-verified remote HTTPS/GitHub),
+// optionally merges .waypost.local.yaml in local mode, and computes a deterministic policy digest.
 func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	mode := opts.Mode
 	if mode == "" {
@@ -102,11 +109,14 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 
 	currDir := absRepo
 	currRelDir := "."
+	fromRemote := false
 	nextRef := strings.TrimSpace(rootCfg.Extends)
 	var repoAncestorTrustPaths []string
 
 	for nextRef != "" {
-		parentCfg, step, parentDir, parentRelDir, visitKey, repoRelPath, err := resolveParent(nextRef, absRepo, currDir, currRelDir, mode, opts.RepoFileReader)
+		parentCfg, step, parentDir, parentRelDir, visitKey, repoRelPath, isRemoteParent, err := resolveParent(
+			nextRef, absRepo, currDir, currRelDir, mode, fromRemote, opts,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -120,10 +130,10 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 		layers = append(layers, layer{cfg: parentCfg, step: step})
 		currDir = parentDir
 		currRelDir = parentRelDir
+		fromRemote = fromRemote || isRemoteParent
 		nextRef = strings.TrimSpace(parentCfg.Extends)
 	}
 
-	// Merge from oldest ancestor to root config.
 	var effective Config
 	effective.SchemaVersion = version.SchemaVersion
 	chain := make([]InheritanceStep, 0, len(layers)-1)
@@ -134,12 +144,10 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 		effective = mergeConfigs(effective, *layers[i].cfg)
 	}
 
-	// Automatically treat any in-repo file-based `extends` ancestors as trust_paths.
 	if len(repoAncestorTrustPaths) > 0 {
 		effective.Policy.TrustPaths = mergeUniqueStrings(effective.Policy.TrustPaths, repoAncestorTrustPaths)
 	}
 
-	// Handle .waypost.local.yaml strictly according to mode:
 	// In CI mode, never open or read .waypost.local.yaml (only Lstat to report ignored=true).
 	localApplied := false
 	localIgnored := false
@@ -199,15 +207,15 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	}, nil
 }
 
-func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader ReadRepoFileFunc) (*Config, *InheritanceStep, string, string, string, string, error) {
+func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, fromRemote bool, opts LoadOptions) (*Config, *InheritanceStep, string, string, string, string, bool, error) {
 	if presets.IsBuiltin(ref) {
 		b, err := presets.Resolve(ref)
 		if err != nil {
-			return nil, nil, "", "", "", "", err
+			return nil, nil, "", "", "", "", false, err
 		}
 		cfg, err := ParseBytes(b.Raw, b.Ref)
 		if err != nil {
-			return nil, nil, "", "", "", "", err
+			return nil, nil, "", "", "", "", false, err
 		}
 		step := &InheritanceStep{
 			Ref:     b.Ref,
@@ -215,20 +223,47 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader Re
 			Version: b.Version,
 			SHA256:  b.SHA256,
 		}
-		return cfg, step, baseDir, baseRelDir, "builtin:" + b.Name, "", nil
+		return cfg, step, baseDir, baseRelDir, "builtin:" + b.Name, "", false, nil
 	}
 
-	// Never allow inheriting from .waypost.local.yaml in CI mode.
+	if remote.IsRemote(ref) {
+		expectedSHA := ""
+		if opts.PinnedRemoteSHAs != nil {
+			expectedSHA = strings.ToLower(strings.TrimSpace(opts.PinnedRemoteSHAs[strings.TrimSpace(ref)]))
+		}
+		if opts.RequirePinnedRemote && !remote.IsValidSHA256Hex(expectedSHA) {
+			return nil, nil, "", "", "", "", true, fmt.Errorf("remote preset %q is not validly SHA-256 pinned in .waypost.lock (run `waypost upgrade --apply`)", ref)
+		}
+		r, err := remote.Fetch(ref, expectedSHA, opts.Offline)
+		if err != nil {
+			return nil, nil, "", "", "", "", true, err
+		}
+		cfg, err := ParseBytes(r.Raw, r.Ref)
+		if err != nil {
+			return nil, nil, "", "", "", "", true, err
+		}
+		step := &InheritanceStep{
+			Ref:     r.Ref,
+			Source:  "remote",
+			URL:     r.URL,
+			Version: cfg.PresetVersion,
+			SHA256:  r.SHA256,
+		}
+		return cfg, step, baseDir, baseRelDir, "remote:" + r.URL, "", true, nil
+	}
+
+	// Security boundary: a remote preset may NEVER extend a local filesystem path!
+	if fromRemote {
+		return nil, nil, "", "", "", "", false, fmt.Errorf("remote preset cannot extend local file path %q (only builtin: or remote refs allowed)", ref)
+	}
+
 	cleanRefBase := filepath.Base(filepath.Clean(ref))
 	if mode == "ci" && cleanRefBase == LocalConfigFileName {
-		return nil, nil, "", "", "", "", fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
+		return nil, nil, "", "", "", "", false, fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
 	}
 
-	// Trusted repo reader path (e.g. resolving base-branch policy floor strictly from git commit).
-	// Any in-repo ancestor MUST be read from git (never the PR worktree). External sibling presets
-	// strictly outside the repository root (e.g. an adjacent org-presets checkout) may be read from
-	// disk only after verifying their resolved path does not re-enter the PR repository via symlinks.
-	if repoReader != nil {
+	// Trusted repo reader path (resolving base-branch policy floor strictly from git commit).
+	if opts.RepoFileReader != nil {
 		isExternal := filepath.IsAbs(ref)
 		joinedRel := ""
 		if !isExternal {
@@ -238,16 +273,16 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader Re
 			}
 		}
 		if !isExternal {
-			raw, exists, err := repoReader(joinedRel)
+			raw, exists, err := opts.RepoFileReader(joinedRel)
 			if err != nil {
-				return nil, nil, "", "", "", "", fmt.Errorf("read extends preset %q from trusted ref: %w", joinedRel, err)
+				return nil, nil, "", "", "", "", false, fmt.Errorf("read extends preset %q from trusted ref: %w", joinedRel, err)
 			}
 			if !exists {
-				return nil, nil, "", "", "", "", fmt.Errorf("extends preset %q not found in trusted git ref", joinedRel)
+				return nil, nil, "", "", "", "", false, fmt.Errorf("extends preset %q not found in trusted git ref", joinedRel)
 			}
 			cfg, err := ParseBytes(raw, "git:"+joinedRel)
 			if err != nil {
-				return nil, nil, "", "", "", "", err
+				return nil, nil, "", "", "", "", false, err
 			}
 			step := &InheritanceStep{
 				Ref:     ref,
@@ -255,45 +290,43 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader Re
 				Version: cfg.PresetVersion,
 				SHA256:  sha256Hex(raw),
 			}
-			return cfg, step, baseDir, filepath.ToSlash(filepath.Dir(joinedRel)), "repo:" + joinedRel, joinedRel, nil
+			return cfg, step, baseDir, filepath.ToSlash(filepath.Dir(joinedRel)), "repo:" + joinedRel, joinedRel, false, nil
 		}
-		// Verify external path truly resolves outside absRepo (no symlink back into PR checkout).
 		extPath := ref
 		if !filepath.IsAbs(extPath) {
 			extPath = filepath.Join(baseDir, extPath)
 		}
 		realExt, err := filepath.EvalSymlinks(extPath)
 		if err != nil {
-			return nil, nil, "", "", "", "", fmt.Errorf("resolve external extends preset %q: %w", ref, err)
+			return nil, nil, "", "", "", "", false, fmt.Errorf("resolve external extends preset %q: %w", ref, err)
 		}
 		realRepo, err := filepath.EvalSymlinks(absRepo)
 		if err == nil {
 			if rel, relErr := filepath.Rel(realRepo, realExt); relErr == nil && !strings.HasPrefix(rel, "..") {
-				return nil, nil, "", "", "", "", fmt.Errorf("external extends path %q symlinks back into PR repository", ref)
+				return nil, nil, "", "", "", "", false, fmt.Errorf("external extends path %q symlinks back into PR repository", ref)
 			}
 		}
 	}
 
-	// Filesystem preset path.
 	p := ref
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(baseDir, p)
 	}
 	absPath, err := filepath.Abs(p)
 	if err != nil {
-		return nil, nil, "", "", "", "", fmt.Errorf("resolve extends path %q: %w", ref, err)
+		return nil, nil, "", "", "", "", false, fmt.Errorf("resolve extends path %q: %w", ref, err)
 	}
 	if mode == "ci" && filepath.Clean(absPath) == filepath.Clean(filepath.Join(absRepo, LocalConfigFileName)) {
-		return nil, nil, "", "", "", "", fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
+		return nil, nil, "", "", "", "", false, fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
 	}
 
 	raw, err := os.ReadFile(absPath)
 	if err != nil {
-		return nil, nil, "", "", "", "", fmt.Errorf("read extends preset %q (%s): %w", ref, absPath, err)
+		return nil, nil, "", "", "", "", false, fmt.Errorf("read extends preset %q (%s): %w", ref, absPath, err)
 	}
 	cfg, err := ParseBytes(raw, absPath)
 	if err != nil {
-		return nil, nil, "", "", "", "", err
+		return nil, nil, "", "", "", "", false, err
 	}
 	step := &InheritanceStep{
 		Ref:     ref,
@@ -310,7 +343,7 @@ func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader Re
 		}
 	}
 
-	return cfg, step, filepath.Dir(absPath), filepath.Dir(repoRelPath), "file:" + filepath.Clean(absPath), repoRelPath, nil
+	return cfg, step, filepath.Dir(absPath), filepath.Dir(repoRelPath), "file:" + filepath.Clean(absPath), repoRelPath, false, nil
 }
 
 func validateSingle(cfg *Config, label string) error {

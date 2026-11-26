@@ -18,7 +18,8 @@
         "required": ["ref", "source", "sha256"],
         "properties": {
           "ref": { "type": "string" },
-          "source": { "type": "string", "enum": ["builtin", "file"] },
+          "source": { "type": "string", "enum": ["builtin", "file", "remote"] },
+          "url": { "type": "string" },
           "version": { "type": "string" },
           "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
         }

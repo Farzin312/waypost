@@ -1,7 +1,6 @@
 package verify
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Farzin312/waypost/internal/compmap"
@@ -18,6 +18,7 @@ import (
 	"github.com/Farzin312/waypost/internal/gitdiff"
 	"github.com/Farzin312/waypost/internal/lockfile"
 	"github.com/Farzin312/waypost/internal/policy"
+	"github.com/Farzin312/waypost/internal/shellcmd"
 	"github.com/Farzin312/waypost/internal/version"
 )
 
@@ -29,12 +30,20 @@ const (
 	StatusSkip = "SKIP"
 )
 
+const (
+	// maxCapturedOutputBytes bounds per-check captured stdout/stderr in memory (64 KiB)
+	// so noisy builds cannot exhaust RAM while still retaining both head and tail context.
+	maxCapturedOutputBytes = 64 * 1024
+	maxExcerptBytes        = 1200
+)
+
 // Options configures a verification run.
 type Options struct {
-	Mode   string // "local" | "ci"
-	Base   string
-	Frozen bool
-	All    bool
+	Mode    string // "local" | "ci"
+	Base    string
+	Frozen  bool
+	All     bool
+	Offline bool
 }
 
 // Receipt is the versioned machine-readable verification artifact (receipt.v1.json).
@@ -117,26 +126,15 @@ type ReceiptSummary struct {
 
 // Run executes waypost verification end-to-end and returns a deterministic Receipt.
 // Security ordering:
-// 1. Inspect git snapshot and resolve trusted base policy floor from git (never PR worktree).
-// 2. Verify frozen lockfile and CI preflight guards BEFORE executing any providers or checks.
-// 3. Build component map (enabling providers ONLY if lock & base policy allow them).
-// 4. Plan and execute checks with strict 4-state outcomes and redacted excerpts.
+// 1. Read any committed .waypost.lock remote SHA pins before resolving inheritance.
+// 2. Inspect git snapshot and resolve trusted base policy floor from git (never PR worktree).
+// 3. Verify frozen lockfile and CI preflight guards BEFORE executing any providers or checks.
+// 4. Build component map (enabling providers ONLY if lock & base policy allow them).
+// 5. Plan and execute checks with strict 4-state outcomes, bounded output, and redacted excerpts.
 func Run(repoDir string, opts Options) (*Receipt, error) {
 	mode := opts.Mode
 	if mode == "" {
 		mode = "local"
-	}
-
-	resolved, err := config.Load(repoDir, config.LoadOptions{Mode: mode})
-	if err != nil {
-		return nil, err
-	}
-	canonicalRes := resolved
-	if mode != "ci" && resolved.LocalOverrideApplied {
-		canonicalRes, err = config.Load(repoDir, config.LoadOptions{Mode: "ci"})
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	snap, err := gitdiff.Inspect(repoDir, opts.Base, mode)
@@ -144,8 +142,38 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 		return nil, err
 	}
 
+	// Evaluate early git preflight failures BEFORE resolving remote presets so a
+	// dirty or invalid CI checkout never makes outbound network requests.
+	gitPreflightFailed := mode == "ci" && (snap.MergeBaseError != "" ||
+		(snap.IsGitRepo && snap.Dirty) ||
+		(snap.IsGitRepo && snap.BaseSHA == "" && !opts.All))
+
+	existingLock, _, _ := lockfile.Read(repoDir)
+	pinnedRemote := lockfile.PinnedRemoteSHAs(existingLock)
+	requirePinnedRemote := opts.Frozen || opts.Offline || mode == "ci"
+
+	loadOpts := config.LoadOptions{
+		Mode:                mode,
+		PinnedRemoteSHAs:    pinnedRemote,
+		RequirePinnedRemote: requirePinnedRemote,
+		Offline:             opts.Offline || gitPreflightFailed,
+	}
+	resolved, err := config.Load(repoDir, loadOpts)
+	if err != nil {
+		return nil, err
+	}
+	canonicalRes := resolved
+	if mode != "ci" && resolved.LocalOverrideApplied {
+		ciLoadOpts := loadOpts
+		ciLoadOpts.Mode = "ci"
+		canonicalRes, err = config.Load(repoDir, ciLoadOpts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Load trusted base policy floor FIRST so PR cannot disable CI controls.
-	baseFloor := policy.LoadBaseFloor(repoDir, mode, resolved, snap)
+	baseFloor := policy.LoadBaseFloor(repoDir, mode, resolved, snap, opts.Offline)
 	lockReq := opts.Frozen || (mode == "ci" && baseFloor.RequireFrozenLockInCI)
 	lockRes := lockfile.Verify(repoDir, canonicalRes)
 
@@ -327,21 +355,21 @@ func executeCheck(repoDir string, sc policy.SelectedCheck) CheckResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", chk.Command)
+	cmd := shellcmd.CommandContext(ctx, chk.Command)
 	workDir := repoDir
 	if chk.Workdir != "" {
 		workDir = filepath.Join(repoDir, chk.Workdir)
 	}
 	cmd.Dir = workDir
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	buf := newCappedBuffer(maxCapturedOutputBytes)
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 
 	start := time.Now()
 	err := cmd.Run()
 	cr.DurationMS = time.Since(start).Milliseconds()
-	cr.OutputExcerpt = RedactAndTrim(buf.String(), 600)
+	cr.OutputExcerpt = RedactAndTrim(buf.String(), maxExcerptBytes)
 
 	if err == nil {
 		cr.Status = StatusPass
@@ -367,16 +395,88 @@ func executeCheck(repoDir string, sc policy.SelectedCheck) CheckResult {
 	return cr
 }
 
+// cappedBuffer bounds captured command output in memory while preserving both
+// the initial head and rolling tail so error summaries at the end are retained.
+type cappedBuffer struct {
+	mu        sync.Mutex
+	headLimit int
+	tailLimit int
+	head      []byte
+	tail      []byte
+	dropped   int64
+}
+
+func newCappedBuffer(totalLimit int) *cappedBuffer {
+	if totalLimit < 256 {
+		totalLimit = 256
+	}
+	headLimit := totalLimit / 4
+	tailLimit := totalLimit - headLimit
+	return &cappedBuffer{
+		headLimit: headLimit,
+		tailLimit: tailLimit,
+	}
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	origLen := len(p)
+	if len(b.head) < b.headLimit {
+		need := b.headLimit - len(b.head)
+		if len(p) <= need {
+			b.head = append(b.head, p...)
+			return origLen, nil
+		}
+		b.head = append(b.head, p[:need]...)
+		p = p[need:]
+	}
+
+	// Append remaining bytes into rolling tail window of size tailLimit.
+	if len(p) >= b.tailLimit {
+		b.dropped += int64(len(b.tail) + len(p) - b.tailLimit)
+		b.tail = append(b.tail[:0], p[len(p)-b.tailLimit:]...)
+		return origLen, nil
+	}
+	overflow := len(b.tail) + len(p) - b.tailLimit
+	if overflow > 0 {
+		b.dropped += int64(overflow)
+		copy(b.tail, b.tail[overflow:])
+		b.tail = b.tail[:len(b.tail)-overflow]
+	}
+	b.tail = append(b.tail, p...)
+	return origLen, nil
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.dropped == 0 {
+		out := make([]byte, 0, len(b.head)+len(b.tail))
+		out = append(out, b.head...)
+		out = append(out, b.tail...)
+		return string(out)
+	}
+	marker := fmt.Sprintf("\n... [%d bytes omitted] ...\n", b.dropped)
+	out := make([]byte, 0, len(b.head)+len(marker)+len(b.tail))
+	out = append(out, b.head...)
+	out = append(out, marker...)
+	out = append(out, b.tail...)
+	return string(out)
+}
+
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9\-._~+/]+=*`),
 	regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}\b`),
 	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}\b`),
 	regexp.MustCompile(`\bsk-[A-Za-z0-9\-_]{16,}\b`),
 	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
-	regexp.MustCompile(`(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*[=:]\s*)([^\s'"]+)`),
+	regexp.MustCompile(`(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s'"]+)`),
 }
 
-// RedactAndTrim strips likely credentials from command excerpts and bounds length.
+// RedactAndTrim strips likely credentials from command excerpts and bounds length,
+// keeping both head and tail when truncated so trailing failure traces stay visible.
 func RedactAndTrim(raw string, maxBytes int) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -384,17 +484,24 @@ func RedactAndTrim(raw string, maxBytes int) string {
 	}
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllStringFunc(s, func(match string) string {
-			if idx := strings.IndexAny(match, "=:"); idx > 0 {
-				return match[:idx+1] + "[REDACTED]"
-			}
 			if strings.HasPrefix(strings.ToLower(match), "bearer ") {
 				return match[:7] + "[REDACTED]"
+			}
+			if idx := strings.IndexAny(match, "=:"); idx > 0 {
+				return match[:idx+1] + "[REDACTED]"
 			}
 			return "[REDACTED]"
 		})
 	}
 	if maxBytes > 0 && len(s) > maxBytes {
-		s = s[:maxBytes] + "... [truncated]"
+		const sep = "\n... [truncated] ...\n"
+		if maxBytes <= len(sep)+16 {
+			return s[:maxBytes] + "... [truncated]"
+		}
+		avail := maxBytes - len(sep)
+		headLen := avail / 3
+		tailLen := avail - headLen
+		s = strings.TrimRight(s[:headLen], "\r\n ") + sep + strings.TrimLeft(s[len(s)-tailLen:], "\r\n ")
 	}
 	return s
 }

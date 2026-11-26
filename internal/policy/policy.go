@@ -8,6 +8,7 @@ import (
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/gitdiff"
+	"github.com/Farzin312/waypost/internal/lockfile"
 )
 
 // SelectedCheck binds a check to whether it will run and why.
@@ -33,7 +34,7 @@ type BaseFloor struct {
 // its file-based `extends` ancestors strictly from `git show <TargetSHA>:<path>`
 // (never touching the PR worktree). In CI mode, this runs BEFORE planning, provider
 // execution, or check execution so a PR cannot disable its own CI policy floor.
-func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *gitdiff.Snapshot) BaseFloor {
+func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *gitdiff.Snapshot, offline bool) BaseFloor {
 	bf := BaseFloor{
 		RequireFrozenLockInCI: config.BoolVal(headRes.Effective.Policy.RequireFrozenLockInCI, true),
 		FailClosedOnUnmapped:  config.BoolVal(headRes.Effective.Policy.FailClosedOnUnmapped, true),
@@ -61,11 +62,21 @@ func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *g
 		return bf
 	}
 
+	var basePinned map[string]string
+	if lockRaw, lockExists, lockErr := reader(lockfile.LockFileName); lockErr == nil && lockExists {
+		if baseLF, _, parseErr := lockfile.ParseBytes(lockRaw); parseErr == nil {
+			basePinned = lockfile.PinnedRemoteSHAs(baseLF)
+		}
+	}
+
 	baseRes, loadErr := config.Load(repoDir, config.LoadOptions{
-		Mode:            "ci",
-		OverrideRootRaw: baseRaw,
-		OverrideLabel:   ref + ":" + config.ConfigFileName,
-		RepoFileReader:  reader,
+		Mode:                "ci",
+		OverrideRootRaw:     baseRaw,
+		OverrideLabel:       ref + ":" + config.ConfigFileName,
+		RepoFileReader:      reader,
+		PinnedRemoteSHAs:    basePinned,
+		RequirePinnedRemote: true,
+		Offline:             offline,
 	})
 	if loadErr != nil {
 		bf.LoadError = fmt.Sprintf("base policy floor at %s failed to resolve: %v", ref, loadErr)
@@ -117,6 +128,7 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 		config.ConfigFileName,
 		".waypost.lock",
 		".github/workflows/**",
+		".bounds/**",
 	}, cfg.Policy.TrustPaths...)
 	for _, c := range cm.Components {
 		trustPaths = append(trustPaths, c.TrustPaths...)

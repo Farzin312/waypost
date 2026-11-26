@@ -18,8 +18,9 @@ import (
 
 // Options controls a preset/lockfile upgrade run.
 type Options struct {
-	Target string // Optional new `extends` reference
-	Apply  bool   // False = dry-run (default)
+	Target  string // Optional new `extends` reference
+	Apply   bool   // False = dry-run (default)
+	Offline bool   // Restrict remote preset resolution to verified local cache
 }
 
 // Plan reports the exact reviewable delta of upgrading inheritance/lockfile state.
@@ -39,6 +40,7 @@ type Plan struct {
 	RemovedChecks        []string `json:"removed_checks,omitempty"`
 	ChangedChecks        []string `json:"changed_checks,omitempty"`
 	PermissionChanges    []string `json:"permission_changes,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
 }
 
 // Run computes a reviewable upgrade plan and, when opts.Apply is true, updates
@@ -51,12 +53,36 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		return nil, fmt.Errorf("read %s: %w", cfgPath, err)
 	}
 
-	beforeRes, err := config.Load(repoDir, config.LoadOptions{Mode: "ci"})
-	if err != nil {
-		return nil, fmt.Errorf("load current config: %w", err)
-	}
 	prevLock, prevLockDigest, _ := lockfile.Read(repoDir)
 	prevLockRaw, _ := os.ReadFile(filepath.Join(repoDir, lockfile.LockFileName))
+	pinnedPrev := lockfile.PinnedRemoteSHAs(prevLock)
+
+	// Prefer loading the previously locked remote snapshot from local cache for accurate
+	// before/after diffs; if the old remote blob is absent locally, warn clearly and preserve
+	// the previous locked policy digest so remote mutations are never hidden.
+	var beforeRes *config.ResolvedConfig
+	var upgradeWarnings []string
+	if len(pinnedPrev) > 0 {
+		beforeRes, err = config.Load(repoDir, config.LoadOptions{
+			Mode:                "ci",
+			PinnedRemoteSHAs:    pinnedPrev,
+			RequirePinnedRemote: true,
+			Offline:             true,
+		})
+		if beforeRes == nil {
+			upgradeWarnings = append(upgradeWarnings,
+				"previous locked remote preset snapshot not found in local cache; rule/check delta against previous remote content may be incomplete (policy/lock digest delta reflects exact change)")
+		}
+	}
+	if beforeRes == nil {
+		beforeRes, err = config.Load(repoDir, config.LoadOptions{
+			Mode:    "ci",
+			Offline: opts.Offline,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("load current config: %w", err)
+		}
+	}
 
 	rawAfter := rawBefore
 	targetExt := strings.TrimSpace(opts.Target)
@@ -69,11 +95,17 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		targetExt = beforeRes.Effective.Extends
 	}
 
-	afterRes, err := config.Load(repoDir, config.LoadOptions{
+	afterLoadOpts := config.LoadOptions{
 		Mode:            "ci",
 		OverrideRootRaw: rawAfter,
 		OverrideLabel:   cfgPath + " (candidate)",
-	})
+		Offline:         opts.Offline,
+	}
+	if opts.Offline {
+		afterLoadOpts.PinnedRemoteSHAs = pinnedPrev
+		afterLoadOpts.RequirePinnedRemote = true
+	}
+	afterRes, err := config.Load(repoDir, afterLoadOpts)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target config: %w", err)
 	}
@@ -86,14 +118,19 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	newLockSum := sha256.Sum256(newLockBytes)
 	newLockDigestPreview := hex.EncodeToString(newLockSum[:])
 
+	prevPolicyDigest := beforeRes.PolicyDigest
+	if prevLock != nil && prevLock.PolicyDigest != "" {
+		prevPolicyDigest = prevLock.PolicyDigest
+	}
 	plan := &Plan{
 		Applied:              false,
 		PreviousExtends:      beforeRes.Effective.Extends,
 		TargetExtends:        targetExt,
-		PreviousPolicyDigest: beforeRes.PolicyDigest,
+		PreviousPolicyDigest: prevPolicyDigest,
 		NewPolicyDigest:      afterRes.PolicyDigest,
 		PreviousLockDigest:   prevLockDigest,
 		NewLockDigest:        newLockDigestPreview,
+		Warnings:             upgradeWarnings,
 	}
 
 	// Compare complete rules.

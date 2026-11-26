@@ -120,10 +120,11 @@ type ProviderConfig struct {
 
 // InheritanceStep records one resolved ancestor in the single-parent chain.
 type InheritanceStep struct {
-	Ref     string `json:"ref"`
-	Source  string `json:"source"` // "builtin" | "file"
-	Version string `json:"version,omitempty"`
-	SHA256  string `json:"sha256"`
+	Ref     string `yaml:"ref" json:"ref"`
+	Source  string `yaml:"source" json:"source"` // "builtin" | "file" | "remote"
+	URL     string `yaml:"url,omitempty" json:"url,omitempty"`
+	Version string `yaml:"version,omitempty" json:"version,omitempty"`
+	SHA256  string `yaml:"sha256" json:"sha256"`
 }
 
 // ResolvedConfig holds the merged effective configuration alongside its provenance.

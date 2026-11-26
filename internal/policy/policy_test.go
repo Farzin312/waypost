@@ -128,7 +128,7 @@ checks:
 	if err != nil {
 		t.Fatal(err)
 	}
-	bf := LoadBaseFloor(dir, "ci", resolved, snap)
+	bf := LoadBaseFloor(dir, "ci", resolved, snap, false)
 	if !bf.Enforced || !bf.RequireFrozenLockInCI || !bf.FailClosedOnUnmapped {
 		t.Fatalf("expected trusted base controls enforced, got %+v", bf)
 	}
