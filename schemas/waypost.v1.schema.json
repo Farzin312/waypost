@@ -128,6 +128,113 @@
     },
     "coverage_gaps": { "type": "array", "items": { "type": "string" } },
     "disable_checks": { "type": "array", "items": { "type": "string" } },
-    "disable_rules": { "type": "array", "items": { "type": "string" } }
+    "disable_rules": { "type": "array", "items": { "type": "string" } },
+    "boundaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "enforce",
+            "warn"
+          ]
+        },
+        "no_cycles": {
+          "type": "boolean"
+        },
+        "enforce_declared_deps": {
+          "type": "boolean"
+        },
+        "ignore_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              "from": {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "target": {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "allow_depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "deny_depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              },
+              "public_entrypoints": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "from",
+                  "allow_depends_on"
+                ]
+              },
+              {
+                "required": [
+                  "from",
+                  "deny_depends_on"
+                ]
+              },
+              {
+                "required": [
+                  "target",
+                  "public_entrypoints"
+                ]
+              }
+            ],
+            "dependentRequired": {
+              "allow_depends_on": [
+                "from"
+              ],
+              "deny_depends_on": [
+                "from"
+              ],
+              "public_entrypoints": [
+                "target"
+              ]
+            }
+          }
+        }
+      }
+    }
   }
 }

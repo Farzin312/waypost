@@ -10,7 +10,7 @@ Instead, Waypost composes actively maintained OSS standards and tools through `.
 | --- | --- | --- |
 | Agent Entrypoint | [AGENTS.md](https://agents.md) (AAIF) | `waypost init` manages a compact `<!-- waypost:begin -->` pointer block while preserving user instructions (optional `--claude-md` creates `@AGENTS.md` pointer) |
 | Reusable Skills | [agentskills.io](https://agentskills.io) | Discovered read-only under `.agents/skills/*/SKILL.md` (with `.claude/skills/` duplicate warnings) and declared under `skills:` with `authorized: false` default |
-| Module Boundary Graphs | `bounds` (or custom JSON graph tools) | Reads `.bounds/manifests/*.yaml` natively with zero code execution; active CLI providers (`providers:`) stay behind explicit `authorized: true` |
+| Architecture & Module Boundaries | **Built-in `waypost graph` & `boundaries:`** (replaces legacy `.bounds`) | Native pure-Go polyglot static import scanner (TS/JS, Go, Python, Rust) enforced inside `waypost verify`; use `waypost init --from-bounds` to retire legacy `.bounds/` cleanly |
 | Shared Org Presets | `github:<owner>/<repo>/<path>@<ref>` or `https://...` | Inherited via single-parent `extends`, SHA-256-pinned in `.waypost.lock`, cached content-addressed under `~/.cache/waypost/presets/`, and verifiable `--offline` |
 | Secret Scanning | `gitleaks` | Declared as a required `check` with `requires_bin: gitleaks` (fails closed if missing in CI) |
 | Spend / Budget Guards | `costlock` or repo wrapper scripts | Invoked as standard checks or CI steps alongside `waypost verify` |

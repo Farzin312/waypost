@@ -29,6 +29,7 @@ const (
 type BuildOptions struct {
 	AllowProviders          bool
 	AllowedProviderCommands map[string]string
+	AllowedFiles            map[string]bool // nil permits all static discovery inputs
 }
 
 // Component is one node in the repository's "what builds on what" map.
@@ -110,26 +111,24 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 		return nil, err
 	}
 
-	inferred, gaps, err := inferManifests(absRepo)
+	byID := make(map[string]Component)
+	byRoot := make(map[string]string)
+	inferred, gaps, err := inferManifests(absRepo, opts.AllowedFiles)
 	if err != nil {
 		return nil, err
 	}
 	eco := inspectEcosystem(absRepo)
-
-	byID := make(map[string]Component)
-	byRoot := make(map[string]string)
-
 	for _, c := range inferred {
 		byID[c.ID] = c
 		byRoot[normalizeRoot(c.Root)] = c.ID
 	}
 
-	// Merge static `.bounds/manifests/*.yaml` subsystems as tool-observed (zero execution!).
-	if boundsComps, ok := loadBoundsManifests(absRepo); ok {
-		for _, bc := range boundsComps {
-			normRoot := normalizeRoot(bc.Root)
-			byID[bc.ID] = bc
-			byRoot[normRoot] = bc.ID
+	// Merge static legacy subsystem declarations.
+	if project, err := LoadBoundsProject(absRepo, opts.AllowedFiles); err == nil {
+		for _, subsystem := range project.Subsystems {
+			c := subsystem.Component
+			byID[c.ID] = c
+			byRoot[normalizeRoot(c.Root)] = c.ID
 		}
 	}
 
@@ -163,6 +162,7 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 					comp.Entrypoints = prev.Entrypoints
 				}
 				delete(byID, prevID)
+				delete(byRoot, normRoot)
 			} else if prev, ok := byID[dc.ID]; ok {
 				if comp.ManifestFile == "" {
 					comp.ManifestFile = prev.ManifestFile
@@ -170,7 +170,7 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 				if comp.Language == "" {
 					comp.Language = prev.Language
 				}
-				if len(comp.DependsOn) == 0 {
+				if dc.DependsOn == nil {
 					comp.DependsOn = prev.DependsOn
 				}
 			}
@@ -178,7 +178,6 @@ func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string,
 				comp.Paths = defaultPathsForRoot(normRoot)
 			}
 			byID[comp.ID] = comp
-			byRoot[normRoot] = comp.ID
 		}
 	}
 
@@ -337,7 +336,38 @@ type inferredItem struct {
 
 // inferManifests walks absRepo safely (read-only, max depth 4) and extracts
 // manifest-level components without executing any repository code.
-func inferManifests(absRepo string) ([]Component, []string, error) {
+// StaticComponentInput identifies files used to infer component ownership and dependencies.
+func StaticComponentInput(rel string) bool {
+	switch rel {
+	case ".bounds/root.yaml", "tsconfig.json", "requirements.txt":
+		return true
+	}
+	dir, name := filepath.ToSlash(filepath.Dir(rel)), filepath.Base(rel)
+	if dir == ".bounds/manifests" {
+		return strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")
+	}
+	if (dir == "tools" || dir == "scripts") && strings.HasSuffix(name, ".py") {
+		return true // presence only
+	}
+	if dir != "." {
+		parts := strings.Split(dir, "/")
+		if len(parts) > 4 {
+			return false
+		}
+		for _, part := range parts {
+			if skipDirs[part] || strings.HasPrefix(part, ".") {
+				return false
+			}
+		}
+	}
+	switch name {
+	case "go.mod", "package.json", "Cargo.toml", "pyproject.toml":
+		return true
+	}
+	return strings.HasSuffix(name, ".uproject")
+}
+
+func inferManifests(absRepo string, allowedFiles map[string]bool) ([]Component, []string, error) {
 	var items []inferredItem
 	var gaps []string
 	rootsWithManifest := make(map[string]bool)
@@ -362,6 +392,9 @@ func inferManifests(absRepo string) ([]Component, []string, error) {
 			return nil
 		}
 
+		if allowedFiles != nil && !allowedFiles[rel] {
+			return nil
+		}
 		dirRel := normalizeRoot(filepath.ToSlash(filepath.Dir(rel)))
 		base := d.Name()
 
@@ -371,18 +404,18 @@ func inferManifests(absRepo string) ([]Component, []string, error) {
 			items = append(items, inferredItem{comp: c, localDeps: localDeps})
 			rootsWithManifest[dirRel] = true
 		case base == "package.json":
-			c, pkgName, deps := parsePackageJSON(p, dirRel, rel)
+			c, pkgName, deps := parsePackageJSON(p, absRepo, dirRel, rel)
 			items = append(items, inferredItem{comp: c, nodePkg: pkgName, nodeDeps: deps})
 			rootsWithManifest[dirRel] = true
 		case base == "Cargo.toml":
-			c, localDeps := parseCargoToml(p, dirRel, rel)
+			c, localDeps := parseCargoToml(p, absRepo, dirRel, rel)
 			items = append(items, inferredItem{comp: c, localDeps: localDeps})
 			rootsWithManifest[dirRel] = true
 		case base == "pyproject.toml":
-			items = append(items, inferredItem{comp: parsePyprojectToml(p, dirRel, rel)})
+			items = append(items, inferredItem{comp: parsePyprojectToml(p, absRepo, dirRel, rel)})
 			rootsWithManifest[dirRel] = true
 		case strings.HasSuffix(base, ".uproject"):
-			c, gap := parseUProject(p, dirRel, rel)
+			c, gap := parseUProject(p, absRepo, dirRel, rel)
 			items = append(items, inferredItem{comp: c})
 			rootsWithManifest[dirRel] = true
 			if gap != "" {
@@ -408,7 +441,8 @@ func inferManifests(absRepo string) ([]Component, []string, error) {
 		}
 		pyCount := 0
 		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".py") {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".py") &&
+				(allowedFiles == nil || allowedFiles[candDir+"/"+e.Name()]) {
 				pyCount++
 			}
 		}
@@ -488,10 +522,9 @@ func inferManifests(absRepo string) ([]Component, []string, error) {
 func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
 	modName := ""
 	var localDeps []string
-	f, err := os.Open(fullPath)
+	raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
 	if err == nil {
-		defer f.Close()
-		sc := bufio.NewScanner(f)
+		sc := bufio.NewScanner(strings.NewReader(string(raw)))
 		inReplace := false
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
@@ -559,7 +592,7 @@ func parseGoMod(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
 	}, localDeps
 }
 
-func parsePackageJSON(fullPath, dirRel, rel string) (Component, string, []string) {
+func parsePackageJSON(fullPath, repoRoot, dirRel, rel string) (Component, string, []string) {
 	type pkgJSON struct {
 		Name            string            `json:"name"`
 		Main            string            `json:"main"`
@@ -567,7 +600,7 @@ func parsePackageJSON(fullPath, dirRel, rel string) (Component, string, []string
 		DevDependencies map[string]string `json:"devDependencies"`
 	}
 	var pj pkgJSON
-	if raw, err := os.ReadFile(fullPath); err == nil {
+	if raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes); err == nil {
 		_ = json.Unmarshal(raw, &pj)
 	}
 	id := slugFromRootOrName(dirRel, pj.Name, "node-package")
@@ -612,12 +645,12 @@ func isCargoDepSection(section string) bool {
 		strings.HasPrefix(s, "dependencies.") || strings.HasPrefix(s, "dev-dependencies.") || strings.HasPrefix(s, "build-dependencies.")
 }
 
-func parseCargoToml(fullPath, dirRel, rel string) (Component, []string) {
-	name := extractTomlName(fullPath)
+func parseCargoToml(fullPath, repoRoot, dirRel, rel string) (Component, []string) {
+	raw, _ := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
+	name := extractTomlName(raw)
 	var localDeps []string
-	if f, err := os.Open(fullPath); err == nil {
-		defer f.Close()
-		sc := bufio.NewScanner(f)
+	if raw != nil {
+		sc := bufio.NewScanner(strings.NewReader(string(raw)))
 		inDepSection := false
 		for sc.Scan() {
 			line := sc.Text()
@@ -662,8 +695,9 @@ func parseCargoToml(fullPath, dirRel, rel string) (Component, []string) {
 	}, localDeps
 }
 
-func parsePyprojectToml(fullPath, dirRel, rel string) Component {
-	name := extractTomlName(fullPath)
+func parsePyprojectToml(fullPath, repoRoot, dirRel, rel string) Component {
+	raw, _ := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes)
+	name := extractTomlName(raw)
 	return Component{
 		ID:           slugFromRootOrName(dirRel, name, "python-package"),
 		Root:         dirRel,
@@ -676,7 +710,7 @@ func parsePyprojectToml(fullPath, dirRel, rel string) Component {
 	}
 }
 
-func parseUProject(fullPath, dirRel, rel string) (Component, string) {
+func parseUProject(fullPath, repoRoot, dirRel, rel string) (Component, string) {
 	type uModule struct {
 		Name string `json:"Name"`
 		Type string `json:"Type"`
@@ -686,7 +720,7 @@ func parseUProject(fullPath, dirRel, rel string) (Component, string) {
 		Modules           []uModule `json:"Modules"`
 	}
 	var up uProj
-	if raw, err := os.ReadFile(fullPath); err == nil {
+	if raw, err := ReadBoundedRegularFile(repoRoot, fullPath, MaxStaticDiscoveryBytes); err == nil {
 		_ = json.Unmarshal(raw, &up)
 	}
 	baseName := strings.TrimSuffix(filepath.Base(rel), ".uproject")
@@ -710,13 +744,8 @@ func parseUProject(fullPath, dirRel, rel string) (Component, string) {
 	}, gap
 }
 
-func extractTomlName(fullPath string) string {
-	f, err := os.Open(fullPath)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
+func extractTomlName(raw []byte) string {
+	sc := bufio.NewScanner(strings.NewReader(string(raw)))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(line, "name") && strings.Contains(line, "=") {

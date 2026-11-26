@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Farzin312/waypost/internal/archgraph"
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/gitdiff"
@@ -41,6 +42,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		err = runInit(rest, stdout)
 	case "context":
 		err = runContext(rest, stdout)
+	case "graph":
+		return runGraph(rest, stdout, stderr)
 	case "verify":
 		return runVerify(rest, stdout, stderr)
 	case "upgrade":
@@ -67,8 +70,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `waypost — agent-first repository orientation, inheritable policy, and deterministic verification
 
 Usage:
-  waypost init    [--preset auto|base|app-ts|polyglot-native] [--claude-md] [--dir .] [--force]
+  waypost init    [--preset auto|base|app-ts|polyglot-native] [--from-bounds] [--claude-md] [--dir .] [--force]
   waypost context [--changed] [--base <ref>] [--offline] [--format text|json] [--dir .]
+  waypost graph   [--changed] [--base <ref>] [--check-boundaries] [--mermaid] [--offline] [--format text|json] [--dir .]
   waypost verify  [--mode local|ci] [--base <ref>] [--frozen] [--offline] [--all] [--receipt <path>] [--markdown <path>] [--format text|json] [--dir .]
   waypost upgrade [--target <ref>] [--dry-run] [--apply] [--offline] [--format text|json] [--dir .]
   waypost version [--format text|json]
@@ -97,6 +101,7 @@ func runInit(args []string, stdout io.Writer) error {
 	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", ".", "repository root directory")
 	presetName := fs.String("preset", "auto", "preset: auto, base, app-ts, or polyglot-native")
+	fromBounds := fs.Bool("from-bounds", false, "migrate legacy .bounds/ manifests and rules natively into .waypost.yaml")
 	claudeMD := fs.Bool("claude-md", false, "also create a minimal CLAUDE.md pointer to AGENTS.md if absent")
 	force := fs.Bool("force", false, "overwrite existing .waypost.yaml")
 	if err := fs.Parse(args); err != nil {
@@ -136,32 +141,53 @@ func runInit(args []string, stdout io.Writer) error {
 		Extends:       pRef.Ref,
 	}
 
-	// Seed inferred components (skip tool-observed `.bounds` subsystems so `.bounds/manifests/*.yaml`
-	// remains the live single source of truth with zero duplication).
+	// Seed inferred components, or translate legacy `.bounds/` cleanly when --from-bounds is set.
 	hasGo := false
 	hasRust := false
 	boundsCount := 0
-	for _, c := range inferredMap.Components {
-		if c.Provenance == compmap.ProvenanceToolObserved {
-			boundsCount++
-			continue
+	var migrationWarnings []string
+	migratedBounds := false
+	if *fromBounds {
+		bm, err := archgraph.MigrateFromBounds(absDir)
+		if err != nil {
+			return err
 		}
+		initCfg.Components = append(initCfg.Components, bm.Components...)
+		initCfg.Boundaries = bm.Boundaries
+		boundsCount = bm.Subsystems
+		migrationWarnings = bm.Warnings
+		migratedBounds = true
+	} else {
+		for _, c := range inferredMap.Components {
+			if c.Provenance == compmap.ProvenanceToolObserved {
+				boundsCount++
+				continue
+			}
+			if c.Language == "go" {
+				hasGo = true
+			}
+			if c.Language == "rust" {
+				hasRust = true
+			}
+			initCfg.Components = append(initCfg.Components, config.ComponentConfig{
+				ID:          c.ID,
+				Root:        c.Root,
+				Kind:        c.Kind,
+				Language:    c.Language,
+				Description: c.Description,
+				DependsOn:   c.DependsOn,
+				Entrypoints: c.Entrypoints,
+				Paths:       c.Paths,
+			})
+		}
+	}
+	for _, c := range inferredMap.Components {
 		if c.Language == "go" {
 			hasGo = true
 		}
 		if c.Language == "rust" {
 			hasRust = true
 		}
-		initCfg.Components = append(initCfg.Components, config.ComponentConfig{
-			ID:          c.ID,
-			Root:        c.Root,
-			Kind:        c.Kind,
-			Language:    c.Language,
-			Description: c.Description,
-			DependsOn:   c.DependsOn,
-			Entrypoints: c.Entrypoints,
-			Paths:       c.Paths,
-		})
 	}
 
 	// Seed checks accurately from real detected manifests without executing anything.
@@ -216,13 +242,18 @@ func runInit(args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "Initialized waypost in %s\n", absDir)
 	fmt.Fprintf(stdout, "  preset:     %s\n", pRef.Ref)
 	fmt.Fprintf(stdout, "  components: %d declared", len(initCfg.Components))
-	if boundsCount > 0 {
-		fmt.Fprintf(stdout, " (+ %d live .bounds subsystems auto-discovered)", boundsCount)
+	if migratedBounds {
+		fmt.Fprintf(stdout, " (migrated %d subsystems + native boundaries from legacy .bounds/)", boundsCount)
+	} else if boundsCount > 0 {
+		fmt.Fprintf(stdout, " (+ %d legacy .bounds subsystems detected; run with --from-bounds to migrate natively)", boundsCount)
 	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "  config:     %s\n", config.ConfigFileName)
 	fmt.Fprintf(stdout, "  lockfile:   %s (sha256: %s)\n", lockfile.LockFileName, shortHash(lockDigest))
 	fmt.Fprintf(stdout, "  AGENTS.md:  %s\n", agentsUpdated)
+	for _, warning := range migrationWarnings {
+		fmt.Fprintf(stdout, "  Warning: %s\n", warning)
+	}
 	if claudeNote != "" {
 		fmt.Fprintf(stdout, "  CLAUDE.md:  %s\n", claudeNote)
 	}
@@ -424,11 +455,23 @@ type ContextOutput struct {
 	Checks            []config.Check           `json:"checks,omitempty"`
 	Skills            []config.SkillRef        `json:"skills,omitempty"`
 	Ecosystem         compmap.EcosystemInfo    `json:"ecosystem"`
+	Architecture      *ContextArchitecture     `json:"architecture,omitempty"`
 	ProviderStatuses  []compmap.ProviderStatus `json:"provider_statuses,omitempty"`
 	UnmappedPaths     []string                 `json:"unmapped_paths,omitempty"`
 	UnmappedTruncated int                      `json:"unmapped_truncated,omitempty"`
 	CoverageGaps      []string                 `json:"coverage_gaps,omitempty"`
 	Changed           *ContextChanged          `json:"changed,omitempty"`
+}
+
+type ContextArchitecture struct {
+	FilesScanned   int                    `json:"files_scanned"`
+	ImportsScanned int                    `json:"imports_scanned"`
+	ObservedEdges  int                    `json:"observed_edges"`
+	BoundariesMode string                 `json:"boundaries_mode"`
+	Hubs           []string               `json:"hubs,omitempty"`
+	CycleCount     int                    `json:"cycle_count"`
+	ViolationCount int                    `json:"violation_count"`
+	BlastRadius    *archgraph.BlastRadius `json:"blast_radius,omitempty"`
 }
 
 type ContextChanged struct {
@@ -533,6 +576,26 @@ func runContext(args []string, stdout io.Writer) error {
 		out.UnmappedPaths = cm.UnmappedPaths
 	}
 
+	var bCfg *config.BoundariesConfig
+	if cfgPtr != nil {
+		bCfg = cfgPtr.Boundaries
+	}
+	var archRep *archgraph.Report
+	if len(cm.Components) > 0 || bCfg.IsEnabled() {
+		if rep, rErr := archgraph.Analyze(absDir, cm, bCfg); rErr == nil {
+			archRep = rep
+			out.Architecture = &ContextArchitecture{
+				FilesScanned:   rep.FilesScanned,
+				ImportsScanned: rep.ImportsScanned,
+				ObservedEdges:  len(rep.Edges),
+				BoundariesMode: rep.BoundariesMode,
+				Hubs:           rep.Hubs,
+				CycleCount:     len(rep.Cycles),
+				ViolationCount: len(rep.Violations),
+			}
+		}
+	}
+
 	if *changed {
 		snap, err := gitdiff.Inspect(absDir, *base, "local")
 		if err != nil {
@@ -548,6 +611,10 @@ func runContext(args []string, stdout io.Writer) error {
 			AffectedPaths:           snap.AffectedPaths,
 			Impact:                  imp,
 			FailClosedWouldEscalate: failClosed,
+		}
+		if archRep != nil && out.Architecture != nil && len(snap.AffectedPaths) > 0 {
+			br := archRep.ComputeBlastRadius(snap.AffectedPaths)
+			out.Architecture.BlastRadius = &br
 		}
 	}
 
@@ -588,6 +655,14 @@ func renderContextText(w io.Writer, o *ContextOutput) {
 	}
 	if len(ecoTags) > 0 {
 		fmt.Fprintf(w, "  ecosystem: %s\n", strings.Join(ecoTags, ", "))
+	}
+	if o.Architecture != nil {
+		fmt.Fprintf(w, "  arch_graph: files=%d imports=%d edges=%d cycles=%d violations=%d (boundaries=%s)\n",
+			o.Architecture.FilesScanned, o.Architecture.ImportsScanned, o.Architecture.ObservedEdges,
+			o.Architecture.CycleCount, o.Architecture.ViolationCount, o.Architecture.BoundariesMode)
+		if len(o.Architecture.Hubs) > 0 {
+			fmt.Fprintf(w, "  arch_hubs:  %s\n", strings.Join(o.Architecture.Hubs, ", "))
+		}
 	}
 
 	fmt.Fprintf(w, "\nComponents (%d):\n", len(o.Components))
@@ -682,6 +757,105 @@ func renderContextText(w io.Writer, o *ContextOutput) {
 			fmt.Fprintln(w, "  notice:               fail-closed policy would escalate to full repo verification")
 		}
 	}
+}
+
+func runGraph(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("graph", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dir := fs.String("dir", ".", "repository root directory")
+	changed := fs.Bool("changed", false, "compute file-level and component-level blast radius for git diff")
+	base := fs.String("base", "", "base git ref for --changed")
+	checkBounds := fs.Bool("check-boundaries", false, "enforce configured boundaries and exit non-zero on violations")
+	mermaid := fs.Bool("mermaid", false, "render live observed architecture as a Mermaid flowchart")
+	offline := fs.Bool("offline", false, "restrict remote preset resolution to verified local cache")
+	format := fs.String("format", "text", "output format: text or json")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+		return 2
+	}
+
+	absDir, err := filepath.Abs(*dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+		return 1
+	}
+
+	var snap *gitdiff.Snapshot
+	if *changed {
+		snap, err = gitdiff.Inspect(absDir, *base, "local")
+		if err != nil {
+			fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+			return 1
+		}
+		if snap.MergeBaseError != "" {
+			fmt.Fprintf(stderr, "waypost graph: %s\n", snap.MergeBaseError)
+			return 1
+		}
+	}
+
+	var cfgPtr *config.Config
+	var bCfg *config.BoundariesConfig
+	if _, err := os.Stat(filepath.Join(absDir, config.ConfigFileName)); err == nil {
+		existingLock, _, _ := lockfile.Read(absDir)
+		res, err := config.Load(absDir, config.LoadOptions{
+			Mode:                "local",
+			PinnedRemoteSHAs:    lockfile.PinnedRemoteSHAs(existingLock),
+			RequirePinnedRemote: *offline,
+			Offline:             *offline,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+			return 1
+		}
+		cfgPtr = &res.Effective
+		bCfg = res.Effective.Boundaries
+	}
+	if *checkBounds && !bCfg.IsEnabled() {
+		if bCfg == nil {
+			bCfg = &config.BoundariesConfig{}
+		}
+		bCfg.Enabled = config.BoolPtr(true)
+	}
+
+	tracked, _ := gitdiff.ListTrackedFiles(absDir)
+	cm, err := compmap.Build(absDir, cfgPtr, tracked)
+	if err != nil {
+		fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+		return 1
+	}
+
+	rep, err := archgraph.Analyze(absDir, cm, bCfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+		return 1
+	}
+
+	if snap != nil {
+		br := rep.ComputeBlastRadius(snap.AffectedPaths)
+		rep.Blast = &br
+	}
+
+	switch {
+	case *mermaid:
+		fmt.Fprint(stdout, archgraph.RenderMermaid(rep))
+		if *checkBounds {
+			for _, v := range rep.Violations {
+				fmt.Fprintf(stderr, "waypost graph: [%s] %s\n", v.Severity, v.Message)
+			}
+		}
+	case *format == "json":
+		if err := writeJSON(stdout, rep); err != nil {
+			fmt.Fprintf(stderr, "waypost graph: %v\n", err)
+			return 1
+		}
+	default:
+		fmt.Fprint(stdout, archgraph.RenderText(rep))
+	}
+
+	if *checkBounds && len(rep.Violations) > 0 && bCfg.EffectiveMode() == "enforce" {
+		return 1
+	}
+	return 0
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {

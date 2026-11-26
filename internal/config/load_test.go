@@ -1,10 +1,15 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Farzin312/waypost/internal/presets"
 )
 
 func TestLoadBuiltinInheritanceAndLocalOverrideIgnoredInCI(t *testing.T) {
@@ -83,5 +88,50 @@ checks:
 `
 	if _, err := ParseBytes([]byte(dupYAML), "dup.yaml"); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("expected duplicate error, got %v", err)
+	}
+}
+
+func TestNoBoundariesPreservesPolicyDigestAndPinnedAppTSPreset(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "polyglot-native")
+	res, err := Load(dir, LoadOptions{Mode: "ci", Offline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Effective.Boundaries != nil || res.Effective.Boundaries.IsEnabled() {
+		t.Fatalf("omitted boundaries became configured: %+v", res.Effective.Boundaries)
+	}
+	const originalDigest = "236c164a29236f19fd1cf95bc34fea605ebda5796b505cb4f7a90e2b91524d0f"
+	if res.PolicyDigest != originalDigest {
+		t.Fatalf("policy digest = %s, want %s", res.PolicyDigest, originalDigest)
+	}
+	raw, err := json.Marshal(res.Effective)
+	if err != nil || bytes.Contains(raw, []byte(`"boundaries"`)) {
+		t.Fatalf("omitted boundaries are in the effective config JSON: %s, %v", raw, err)
+	}
+	pinned, err := presets.Resolve("builtin:app-ts@1.0.0")
+	const originalSHA = "dd7e7093a8522c523de8a89ab29cef926b24cde97ae7d84f8c6514fed983d4fb"
+	if err != nil || pinned.SHA256 != originalSHA {
+		t.Fatalf("app-ts@1.0.0 pin changed: %+v, %v", pinned, err)
+	}
+}
+
+func TestBoundaryInheritanceDoesNotMutateParent(t *testing.T) {
+	parent := &BoundariesConfig{
+		Enabled:     BoolPtr(true),
+		IgnorePaths: []string{"base/**"},
+		Rules:       []BoundaryRule{{ID: "scope", From: "base", DenyDependsOn: []string{"internal"}}},
+	}
+	child := &BoundariesConfig{
+		Mode:        "warn",
+		IgnorePaths: []string{"local/**"},
+		Rules:       []BoundaryRule{{ID: "scope", From: "child", DenyDependsOn: []string{"internal"}}},
+	}
+	got := mergeConfigs(Config{Boundaries: parent}, Config{Boundaries: child}).Boundaries
+	if !got.IsEnabled() || got.EffectiveMode() != "warn" || got.Rules[0].From != "child" ||
+		!slices.Equal(got.IgnorePaths, []string{"base/**", "local/**"}) {
+		t.Fatalf("merged boundary policy = %+v", got)
+	}
+	if parent.Mode != "" || parent.Rules[0].From != "base" || !slices.Equal(parent.IgnorePaths, []string{"base/**"}) {
+		t.Fatalf("mutation of inherited boundary policy: %+v", parent)
 	}
 }

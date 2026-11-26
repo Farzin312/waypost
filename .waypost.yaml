@@ -1,8 +1,8 @@
-# Waypost v1 repository contract — dogfooding waypost on itself.
+# Waypost v1 repository contract — dogfooding waypost (including native architecture boundaries) on itself.
 schema_version: "1"
 name: waypost
 extends: "builtin:base@1.0.0"
-description: "Agent-first repository orientation, inheritable policy, and deterministic verification CLI."
+description: "Agent-first repository orientation, native architecture boundaries, inheritable policy, and deterministic verification CLI."
 policy:
   fail_closed_on_unmapped: true
   require_frozen_lock_in_ci: true
@@ -16,12 +16,40 @@ policy:
     - "AGENTS.md"
     - "go.mod"
     - "go.sum"
+boundaries:
+  enabled: true
+  mode: enforce
+  no_cycles: true
+  enforce_declared_deps: true
+  ignore_paths:
+    - "**/*_test.go"
+  rules:
+    - id: pure-leaf-packages
+      from: version
+      allow_depends_on: []
+      reason: "internal/version must remain a zero-dependency leaf package"
+    - id: presets-pure-leaf
+      from: presets
+      allow_depends_on: []
+      reason: "internal/presets must remain a zero-dependency embedded catalog"
+    - id: shellcmd-pure-leaf
+      from: shellcmd
+      allow_depends_on: []
+      reason: "internal/shellcmd must remain a zero-dependency OS shell helper"
+    - id: remote-pure-leaf
+      from: remote
+      allow_depends_on: []
+      reason: "internal/remote must remain a zero-dependency HTTPS/cache fetcher"
+    - id: config-no-higher-layers
+      from: config
+      deny_depends_on: ["cli", "verify", "policy", "upgrade", "archgraph"]
+      reason: "internal/config cannot depend on higher orchestration packages"
 components:
   - id: cli-entrypoint
     root: cmd/waypost
     kind: binary
     language: go
-    depends_on: ["cli", "version"]
+    depends_on: ["cli"]
     entrypoints: ["cmd/waypost/main.go"]
     paths: ["cmd/waypost/**"]
     checks: ["go-vet", "go-test-race"]
@@ -29,14 +57,21 @@ components:
     root: internal/cli
     kind: package
     language: go
-    depends_on: ["compmap", "config", "gitdiff", "lockfile", "presets", "upgrade", "verify", "version"]
+    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "presets", "upgrade", "verify", "version"]
     paths: ["internal/cli/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: archgraph
+    root: internal/archgraph
+    kind: package
+    language: go
+    depends_on: ["compmap", "config"]
+    paths: ["internal/archgraph/**"]
     checks: ["go-vet", "go-test-race"]
   - id: config
     root: internal/config
     kind: package
     language: go
-    depends_on: ["presets", "version"]
+    depends_on: ["presets", "remote", "version"]
     paths: ["internal/config/**"]
     checks: ["go-vet", "go-test-race"]
   - id: presets
@@ -45,11 +80,23 @@ components:
     language: go
     paths: ["internal/presets/**"]
     checks: ["go-vet", "go-test-race"]
+  - id: remote
+    root: internal/remote
+    kind: package
+    language: go
+    paths: ["internal/remote/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: shellcmd
+    root: internal/shellcmd
+    kind: package
+    language: go
+    paths: ["internal/shellcmd/**"]
+    checks: ["go-vet", "go-test-race"]
   - id: lockfile
     root: internal/lockfile
     kind: package
     language: go
-    depends_on: ["config", "version"]
+    depends_on: ["config", "remote", "version"]
     paths: ["internal/lockfile/**"]
     checks: ["go-vet", "go-test-race"]
   - id: gitdiff
@@ -62,21 +109,21 @@ components:
     root: internal/compmap
     kind: package
     language: go
-    depends_on: ["config"]
+    depends_on: ["config", "shellcmd"]
     paths: ["internal/compmap/**"]
     checks: ["go-vet", "go-test-race"]
   - id: policy
     root: internal/policy
     kind: package
     language: go
-    depends_on: ["compmap", "config", "gitdiff"]
+    depends_on: ["compmap", "config", "gitdiff", "lockfile"]
     paths: ["internal/policy/**"]
     checks: ["go-vet", "go-test-race"]
   - id: verify
     root: internal/verify
     kind: package
     language: go
-    depends_on: ["compmap", "config", "gitdiff", "lockfile", "policy", "version"]
+    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "policy", "shellcmd", "version"]
     paths: ["internal/verify/**"]
     checks: ["go-vet", "go-test-race"]
   - id: upgrade

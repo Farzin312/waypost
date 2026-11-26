@@ -9,10 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Farzin312/waypost/internal/archgraph"
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/gitdiff"
@@ -208,20 +211,49 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 	}
 
 	var tracked []string
+	var scanOptions archgraph.AnalyzeOptions
+	var inventoryErr error
 	if snap.IsGitRepo {
-		tracked, _ = gitdiff.ListTrackedFiles(repoDir)
+		tracked, inventoryErr = gitdiff.ListTrackedFiles(repoDir)
+		if mode == "ci" {
+			scanOptions.AllowedFiles = fileInventory(tracked)
+		} else {
+			working, err := gitdiff.ListWorkingFiles(repoDir)
+			if err == nil {
+				scanOptions.AllowedFiles = fileInventory(working)
+				scanOptions.AllowMissingFiles = true
+			} else {
+				inventoryErr = err
+			}
+		}
 	}
-	cm, err := compmap.BuildWithOptions(repoDir, &resolved.Effective, tracked, compmap.BuildOptions{
-		AllowProviders:          allowProviders,
-		AllowedProviderCommands: allowedProvCmds,
-	})
+	mapOptions := compmap.BuildOptions{AllowedFiles: scanOptions.AllowedFiles}
+	cm, err := compmap.BuildWithOptions(repoDir, &resolved.Effective, tracked, mapOptions)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := policy.Plan(repoDir, mode, resolved, baseFloor, cm, snap, opts.All)
 	if err != nil {
 		return nil, err
 	}
 
-	plan, err := policy.Plan(repoDir, mode, resolved, baseFloor, cm, snap, opts.All)
-	if err != nil {
-		return nil, err
+	// Boundary checks run on static maps before any provider or shell command can mutate the tree.
+	var boundaryCheck *CheckResult
+	if len(preflightFailures) == 0 && plan.EffectiveBoundaries.IsEnabled() {
+		check := checkBoundaries(repoDir, cm, plan.EffectiveBoundaries, baseFloor, snap, scanOptions, inventoryErr)
+		boundaryCheck = &check
+	}
+	if allowProviders && len(resolved.Effective.Providers) > 0 {
+		mapOptions.AllowProviders = true
+		mapOptions.AllowedProviderCommands = allowedProvCmds
+		cm, err = compmap.BuildWithOptions(repoDir, &resolved.Effective, tracked, mapOptions)
+		if err != nil {
+			return nil, err
+		}
+		plan, err = policy.Plan(repoDir, mode, resolved, baseFloor, cm, snap, opts.All)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	vInfo := version.Current()
@@ -291,19 +323,11 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 		return rec, nil
 	}
 
+	if boundaryCheck != nil {
+		rec.addCheck(*boundaryCheck)
+	}
 	for _, sc := range plan.Checks {
-		cr := executeCheck(repoDir, sc)
-		rec.Checks = append(rec.Checks, cr)
-		switch cr.Status {
-		case StatusPass:
-			rec.Summary.Passed++
-		case StatusFail:
-			rec.Summary.Failed++
-		case StatusWarn:
-			rec.Summary.Warned++
-		case StatusSkip:
-			rec.Summary.Skipped++
-		}
+		rec.addCheck(executeCheck(repoDir, sc))
 	}
 
 	switch {
@@ -316,6 +340,157 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 	}
 
 	return rec, nil
+}
+
+func (r *Receipt) addCheck(check CheckResult) {
+	r.Checks = append(r.Checks, check)
+	switch check.Status {
+	case StatusPass:
+		r.Summary.Passed++
+	case StatusFail:
+		r.Summary.Failed++
+	case StatusWarn:
+		r.Summary.Warned++
+	case StatusSkip:
+		r.Summary.Skipped++
+	}
+}
+
+func fileInventory(files []string) map[string]bool {
+	inventory := make(map[string]bool, len(files))
+	for _, f := range files {
+		inventory[f] = true
+	}
+	return inventory
+}
+
+func checkBoundaries(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfig, floor policy.BaseFloor, snap *gitdiff.Snapshot, opts archgraph.AnalyzeOptions, inventoryErr error) CheckResult {
+	start := time.Now()
+	required := boundaries.EffectiveMode() == "enforce"
+	check := CheckResult{ID: "waypost-boundaries", Command: "waypost graph --check-boundaries (built-in)", Required: required}
+	baseEnforced := floor.Loaded && floor.Enforced && floor.BaseConfig != nil && floor.BaseConfig.Effective.Boundaries.IsEnabled()
+	check.FromBaseFloor = baseEnforced
+	if required {
+		check.Status = StatusFail
+	} else {
+		check.Status = StatusWarn
+	}
+	check.ExitCode = 1
+
+	report, violations, err := collectBoundaryViolations(repoDir, cm, boundaries, floor, snap, baseEnforced, opts, inventoryErr)
+	check.DurationMS = time.Since(start).Milliseconds()
+	if err != nil {
+		check.Reason = "boundary analysis error: " + err.Error()
+		return check
+	}
+	if len(violations) == 0 {
+		check.Status = StatusPass
+		check.ExitCode = 0
+		check.Reason = fmt.Sprintf("0 violations (%d files, %d imports, %d edges)", report.FilesScanned, report.ImportsScanned, len(report.Edges))
+		return check
+	}
+	check.Reason = fmt.Sprintf("%d boundary violation(s)", len(violations))
+	var lines []string
+	for i, violation := range violations {
+		if i >= 12 {
+			lines = append(lines, fmt.Sprintf("... +%d more violations", len(violations)-12))
+			break
+		}
+		lines = append(lines, fmt.Sprintf("[%s] %s", violation.RuleID, violation.Message))
+	}
+	check.OutputExcerpt = RedactAndTrim(strings.Join(lines, "\n"), maxExcerptBytes)
+	return check
+}
+
+// Stage only static discovery inputs from the trusted Git tree. New or modified
+// worktree manifests cannot change how the base policy assigns component ownership.
+func buildBaseBoundaryMap(repoDir string, snap *gitdiff.Snapshot, base *config.Config) (*compmap.Map, error) {
+	ref := snap.TargetSHA
+	if ref == "" {
+		ref = snap.BaseSHA
+	}
+	files, err := gitdiff.RegularFilesAtRef(repoDir, ref)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp("", "waypost-base-components-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+
+	paths := make([]string, 0, len(files))
+	for rel := range files {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+	for _, rel := range paths {
+		if !compmap.StaticComponentInput(rel) {
+			continue
+		}
+		dest := filepath.Join(dir, rel)
+		if !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("invalid base discovery path %q", rel)
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+			return nil, err
+		}
+		var raw []byte
+		if filepath.Ext(rel) != ".py" {
+			if files[rel] > compmap.MaxStaticDiscoveryBytes {
+				return nil, fmt.Errorf("base discovery input %q exceeds %d bytes", rel, compmap.MaxStaticDiscoveryBytes)
+			}
+			var found bool
+			raw, found, err = gitdiff.ReadFileAtRef(repoDir, ref, rel)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, fmt.Errorf("base discovery input %q is missing at %s", rel, ref)
+			}
+		}
+		if err := os.WriteFile(dest, raw, 0o600); err != nil {
+			return nil, err
+		}
+	}
+	return compmap.BuildWithOptions(dir, base, nil, compmap.BuildOptions{AllowedFiles: fileInventory(paths)})
+}
+
+func collectBoundaryViolations(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfig, floor policy.BaseFloor, snap *gitdiff.Snapshot, baseEnforced bool, opts archgraph.AnalyzeOptions, inventoryErr error) (*archgraph.Report, []archgraph.Violation, error) {
+	if inventoryErr != nil {
+		return nil, nil, fmt.Errorf("list Git scan inputs: %w", inventoryErr)
+	}
+	var violations []archgraph.Violation
+	if baseEnforced {
+		base := &floor.BaseConfig.Effective
+		baseMap, err := buildBaseBoundaryMap(repoDir, snap, base)
+		if err != nil {
+			return nil, nil, fmt.Errorf("build trusted base component map: %w", err)
+		}
+		baseReport, err := archgraph.AnalyzeWithOptions(repoDir, baseMap, base.Boundaries, opts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("scan trusted base boundary policy: %w", err)
+		}
+		violations = append(violations, baseReport.Violations...)
+	}
+	report, err := archgraph.AnalyzeWithOptions(repoDir, cm, boundaries, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	seen := make(map[archgraph.Violation]bool)
+	merged := make([]archgraph.Violation, 0, len(violations)+len(report.Violations))
+	for _, v := range slices.Concat(violations, report.Violations) {
+		key := v
+		key.Severity = ""
+		if v.Kind != "scan-error" && v.Kind != "cycle" {
+			key.Message = ""
+		}
+		if !seen[key] {
+			seen[key] = true
+			merged = append(merged, v)
+		}
+	}
+	return report, merged, nil
 }
 
 func executeCheck(repoDir string, sc policy.SelectedCheck) CheckResult {

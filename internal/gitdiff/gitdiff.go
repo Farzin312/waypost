@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -227,7 +228,7 @@ func ReadFileAtRef(repoDir, ref, relPath string) ([]byte, bool, error) {
 	if strings.HasPrefix(cleanRel, "../") || cleanRel == ".." || filepath.IsAbs(relPath) {
 		return nil, false, fmt.Errorf("path %q escapes repository root at ref %s", relPath, ref)
 	}
-	spec := ref + ":" + cleanRel
+	spec := ref + ":./" + cleanRel
 	cmd := exec.Command("git", "-C", repoDir, "show", spec)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -242,17 +243,48 @@ func ReadFileAtRef(repoDir, ref, relPath string) ([]byte, bool, error) {
 	return stdout.Bytes(), true, nil
 }
 
+// RegularFilesAtRef returns repository-relative file sizes for regular blobs in a commit.
+func RegularFilesAtRef(repoDir, ref string) (map[string]int64, error) {
+	out, err := runGitBytes(repoDir, "ls-tree", "-r", "-l", "-z", ref, "--", ".")
+	if err != nil {
+		return nil, err
+	}
+	files := make(map[string]int64)
+	for _, record := range bytes.Split(out, []byte{0}) {
+		meta, name, ok := strings.Cut(string(record), "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 4 || (fields[0] != "100644" && fields[0] != "100755") {
+			continue
+		}
+		size, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("read size of %q at %s: %w", name, ref, err)
+		}
+		files[name] = size
+	}
+	return files, nil
+}
+
 // ListTrackedFiles lists all tracked files in the git repo using NUL-delimited output.
 func ListTrackedFiles(repoDir string) ([]string, error) {
-	out, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "ls-files", "-z")
+	return listFiles(repoDir, "--cached")
+}
+
+// ListWorkingFiles lists tracked and untracked, non-ignored worktree paths.
+func ListWorkingFiles(repoDir string) ([]string, error) {
+	return listFiles(repoDir, "--cached", "--others", "--exclude-standard")
+}
+
+func listFiles(repoDir string, flags ...string) ([]string, error) {
+	args := append([]string{"ls-files", "-z"}, flags...)
+	out, err := runGitBytes(repoDir, args...)
 	if err != nil {
 		return nil, err
 	}
 	var files []string
 	for _, raw := range bytes.Split(out, []byte{0}) {
-		p := string(raw)
-		if p != "" {
-			files = append(files, filepath.ToSlash(p))
+		if len(raw) > 0 {
+			files = append(files, filepath.ToSlash(string(raw)))
 		}
 	}
 	sort.Strings(files)

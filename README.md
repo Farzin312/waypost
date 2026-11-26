@@ -15,7 +15,7 @@ Traditional per-repo "AI delivery systems" break down as projects scale:
 - **Passive markdown failure:** Long `AGENTS.md` instructions decay under long context; only deterministic checks and CI policy floors actually hold.
 - **Blind agents:** Agents waste tokens grepping repositories without knowing *"what builds on what"*, which cross-repo contracts are pinned, which AAIF skills exist locally, or which files sit inside trust boundaries.
 
-`waypost` fixes all four with **5 focused commands**, **1 config file (`.waypost.yaml`)**, **1 frozen lockfile (`.waypost.lock`)**, and **1 provenance-bound verification receipt (`receipt.v1.json`)**.
+`waypost` fixes all four with **6 focused commands** (`init`, `context`, `graph`, `verify`, `upgrade`, `version`), **1 config file (`.waypost.yaml`)**, **1 frozen lockfile (`.waypost.lock`)**, and **1 provenance-bound verification receipt (`receipt.v1.json`)**.
 
 ---
 
@@ -62,12 +62,19 @@ waypost init --claude-md
 
 `waypost init` safely inspects your manifests, lockfiles (`pnpm`/`bun`/`yarn`/`npm`), real `package.json` scripts, `.bounds/manifests/`, and `.agents/skills/` without executing repo code. It selects a fitting preset (`base`, `app-ts`, or `polyglot-native`), writes `.waypost.yaml` and `.waypost.lock`, and inserts a compact pointer block into `AGENTS.md` (preserving your existing instructions).
 
-### Orient any AI agent ("what builds on what")
+### Orient any AI agent ("what builds on what") & enforce architecture boundaries
 
 ```bash
 waypost context --changed
-waypost context --changed --format json
+waypost graph --changed --check-boundaries
+waypost graph --mermaid
 ```
+
+`waypost graph` replaces legacy external boundary tools (like `.bounds` + SQLite cache DBs + generated symbol manifests) with a **built-in, pure-Go polyglot static import engine** (TypeScript/JS with `tsconfig.json` `paths` & `baseUrl`, Go `go/parser` AST, Python, and Rust):
+
+- Computes **live observed component edges**, **high-fan-in hubs**, **file-level + component-level blast radius**, and **circular import cycles with exact `file:line` witnesses** — in milliseconds, with zero cache DBs and zero manifest churn.
+- Enforces declarative `boundaries:` rules (`no_cycles`, `enforce_declared_deps`, `allow_depends_on`, `deny_depends_on`, `public_entrypoints`, `ignore_paths`) inside `waypost verify` as a built-in `waypost-boundaries` check protected by the CI base-branch policy floor.
+- Migrates legacy `.bounds/` repositories cleanly in one command: `waypost init --from-bounds`.
 
 Reports:
 - **Components** with explicit provenance (`declared | inferred | tool-observed`), `depends_on`, reverse `depended_by` (*what builds on this component*), and cycle warnings

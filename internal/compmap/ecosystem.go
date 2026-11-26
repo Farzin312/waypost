@@ -2,6 +2,8 @@ package compmap
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const maxStaticDiscoveryBytes = 512 * 1024 // 512 KiB per static manifest/skill file
+const MaxStaticDiscoveryBytes = 512 * 1024 // 512 KiB per static manifest/skill file
 
 // DiscoveredSkill describes a local AAIF SKILL.md discovered under .agents/skills/
 // without executing any code.
@@ -33,114 +35,215 @@ type EcosystemInfo struct {
 	DuplicateSkillPaths []string          `json:"duplicate_skill_paths,omitempty"`
 }
 
-type boundsManifestYAML struct {
-	Name        string   `yaml:"name"`
-	Role        string   `yaml:"role"`
-	Description string   `yaml:"description"`
-	Paths       []string `yaml:"paths"`
-	Consumes    []struct {
-		Subsystem string `yaml:"subsystem"`
-	} `yaml:"consumes"`
+type BoundsInterface struct {
+	Name string `yaml:"name"`
+	Kind string `yaml:"kind"`
+	Path string `yaml:"path"`
+	File string `yaml:"file"`
 }
 
-// readBoundedRegularFile reads a regular file strictly inside absRepo (rejecting symlinks
-// escaping the repo, FIFOs, sockets, and oversized files) up to maxStaticDiscoveryBytes.
-func readBoundedRegularFile(absRepo, targetPath string) ([]byte, bool) {
-	linfo, err := os.Lstat(targetPath)
+func (i *BoundsInterface) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&i.Name)
+	}
+	type mapping BoundsInterface
+	return node.Decode((*mapping)(i))
+}
+
+type boundsConsume struct {
+	Subsystem string `yaml:"subsystem"`
+}
+
+func (c *boundsConsume) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&c.Subsystem)
+	}
+	type mapping boundsConsume
+	return node.Decode((*mapping)(c))
+}
+
+type boundsManifestYAML struct {
+	Name        string            `yaml:"name"`
+	Role        string            `yaml:"role"`
+	Description string            `yaml:"description"`
+	Paths       []string          `yaml:"paths"`
+	Files       []string          `yaml:"files"`
+	Consumes    []boundsConsume   `yaml:"consumes"`
+	Exposes     []BoundsInterface `yaml:"exposes"`
+}
+
+type BoundsSubsystem struct {
+	Component Component
+	Exposes   []BoundsInterface
+}
+
+type BoundsProject struct {
+	Enforce    string
+	Subsystems []BoundsSubsystem
+	Warnings   []string
+}
+
+func insideRepo(absRepo, targetPath string) error {
+	repo, err := filepath.EvalSymlinks(absRepo)
 	if err != nil {
-		return nil, false
+		return err
 	}
-	resolved := targetPath
-	if linfo.Mode()&os.ModeSymlink != 0 {
-		evalRepo, err := filepath.EvalSymlinks(absRepo)
-		if err != nil {
-			return nil, false
-		}
-		evalTarget, err := filepath.EvalSymlinks(targetPath)
-		if err != nil {
-			return nil, false
-		}
-		rel, err := filepath.Rel(evalRepo, evalTarget)
-		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-			return nil, false
-		}
-		resolved = evalTarget
-		linfo, err = os.Lstat(resolved)
-		if err != nil {
-			return nil, false
-		}
-	}
-	if !linfo.Mode().IsRegular() {
-		return nil, false
-	}
-	f, err := os.Open(resolved)
+	target, err := filepath.EvalSymlinks(targetPath)
 	if err != nil {
-		return nil, false
+		return err
+	}
+	rel, err := filepath.Rel(repo, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %q resolves outside repository", targetPath)
+	}
+	return nil
+}
+
+// ReadBoundedRegularFile reads a regular file inside the repository up to maxBytes.
+func ReadBoundedRegularFile(absRepo, targetPath string, maxBytes int) ([]byte, error) {
+	info, err := os.Lstat(targetPath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular file", targetPath)
+	}
+	if err := insideRepo(absRepo, targetPath); err != nil {
+		return nil, err
+	}
+	if info.Size() > int64(maxBytes) {
+		return nil, fmt.Errorf("%q exceeds %d bytes", targetPath, maxBytes)
+	}
+	rel, err := filepath.Rel(absRepo, targetPath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenInRoot(absRepo, rel)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, maxStaticDiscoveryBytes+1))
-	if err != nil || len(raw) > maxStaticDiscoveryBytes {
-		return nil, false
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-	return raw, true
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, fmt.Errorf("%q changed while opening", targetPath)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxBytes {
+		return nil, fmt.Errorf("%q exceeds %d bytes", targetPath, maxBytes)
+	}
+	return raw, nil
 }
 
-// loadBoundsManifests reads `.bounds/manifests/*.yaml` statically (zero code execution)
-// when present, returning tool-observed components with exact subsystem dependencies.
-func loadBoundsManifests(absRepo string) ([]Component, bool) {
-	manifestsDir := filepath.Join(absRepo, ".bounds", "manifests")
-	entries, err := os.ReadDir(manifestsDir)
-	if err != nil {
-		return nil, false
+// LoadBoundsProject reads legacy manifests and retains their interface metadata for migration.
+func LoadBoundsProject(absRepo string, allowedFiles map[string]bool) (*BoundsProject, error) {
+	result := &BoundsProject{}
+	var root struct {
+		Enforce    string   `yaml:"enforce"`
+		Subsystems []string `yaml:"subsystems"`
+	}
+	const rootFile = ".bounds/root.yaml"
+	if allowedFiles == nil || allowedFiles[rootFile] {
+		raw, err := ReadBoundedRegularFile(absRepo, filepath.Join(absRepo, rootFile), MaxStaticDiscoveryBytes)
+		switch {
+		case err == nil:
+			if err := yaml.Unmarshal(raw, &root); err != nil {
+				return nil, fmt.Errorf("%s: %w", rootFile, err)
+			}
+		case !errors.Is(err, os.ErrNotExist):
+			return nil, err
+		}
+	}
+	result.Enforce = root.Enforce
+	allowedSubsystems := make(map[string]bool, len(root.Subsystems))
+	for _, id := range root.Subsystems {
+		allowedSubsystems[id] = true
 	}
 
-	var comps []Component
+	manifestsDir := filepath.Join(absRepo, ".bounds", "manifests")
+	if err := insideRepo(absRepo, manifestsDir); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(manifestsDir)
+	if err != nil {
+		return nil, err
+	}
+	knownDirs := make(map[string]bool)
+	for f := range allowedFiles {
+		for dir := filepath.Dir(f); dir != "." && !knownDirs[dir]; dir = filepath.Dir(dir) {
+			knownDirs[dir] = true
+		}
+	}
+	loaded := make(map[string]bool)
 	for _, e := range entries {
-		if e.IsDir() || (!strings.HasSuffix(e.Name(), ".yaml") && !strings.HasSuffix(e.Name(), ".yml")) {
+		ext := filepath.Ext(e.Name())
+		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
-		full := filepath.Join(manifestsDir, e.Name())
-		raw, ok := readBoundedRegularFile(absRepo, full)
-		if !ok {
+		stem := strings.TrimSuffix(e.Name(), ext)
+		if len(allowedSubsystems) > 0 && !allowedSubsystems[stem] {
+			continue
+		}
+		rel := ".bounds/manifests/" + e.Name()
+		if allowedFiles != nil && !allowedFiles[rel] {
+			continue
+		}
+		raw, err := ReadBoundedRegularFile(absRepo, filepath.Join(manifestsDir, e.Name()), MaxStaticDiscoveryBytes)
+		if err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
 			continue
 		}
 		var bm boundsManifestYAML
 		if err := yaml.Unmarshal(raw, &bm); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
 			continue
 		}
-		id := strings.TrimSpace(bm.Name)
-		if id == "" {
-			id = strings.TrimSuffix(strings.TrimSuffix(e.Name(), ".yaml"), ".yml")
+		id := nonEmptyStr(bm.Name, stem)
+		if len(allowedSubsystems) > 0 {
+			id = stem
 		}
-		if id == "" {
+		if loaded[id] {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s duplicates subsystem %q", rel, id))
 			continue
 		}
-
+		loaded[id] = true
 		var globs []string
 		root := "."
-		for _, p := range bm.Paths {
-			clean := strings.TrimSpace(filepath.ToSlash(p))
-			for strings.HasPrefix(clean, "./") {
-				clean = strings.TrimPrefix(clean, "./")
-			}
-			clean = strings.Trim(clean, "/")
+		paths := append(bm.Paths, bm.Files...)
+		for _, p := range paths {
+			clean := strings.Trim(strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(p)), "./"), "/")
 			if clean == "" || clean == "." {
 				continue
 			}
-			if root == "." {
-				r := clean
-				if idx := strings.IndexAny(r, "*?["); idx >= 0 {
-					r = strings.TrimSuffix(filepath.ToSlash(filepath.Dir(r[:idx])), "/")
+			prefix := clean
+			switch idx := strings.IndexAny(clean, "*?["); {
+			case idx >= 0:
+				prefix = strings.TrimSuffix(clean[:idx], "/")
+				if idx == 0 || clean[idx-1] != '/' {
+					prefix = filepath.ToSlash(filepath.Dir(prefix))
 				}
-				r = normalizeRoot(r)
-				if r != "" && r != "." {
-					root = r
+				globs = append(globs, clean)
+			default:
+				isDir, isFile := knownDirs[filepath.FromSlash(clean)], allowedFiles[clean]
+				if allowedFiles == nil {
+					if info, err := os.Stat(filepath.Join(absRepo, clean)); err == nil {
+						isDir, isFile = info.IsDir(), !info.IsDir()
+					}
+				}
+				if isFile || (!isDir && filepath.Ext(clean) != "" && !strings.HasSuffix(p, "/")) {
+					prefix = filepath.ToSlash(filepath.Dir(clean))
+					globs = append(globs, clean)
+				} else {
+					globs = append(globs, clean+"/**")
 				}
 			}
-			if strings.ContainsAny(clean, "*?[") {
-				globs = append(globs, clean)
-			} else {
-				globs = append(globs, clean+"/**")
+			if root == "." {
+				root = normalizeRoot(prefix)
 			}
 		}
 		if len(globs) == 0 {
@@ -149,33 +252,33 @@ func loadBoundsManifests(absRepo string) ([]Component, bool) {
 
 		var deps []string
 		for _, c := range bm.Consumes {
-			sub := strings.TrimSpace(c.Subsystem)
-			if sub != "" {
-				deps = append(deps, sub)
-			}
+			deps = append(deps, c.Subsystem)
 		}
-
 		desc := strings.TrimSpace(bm.Description)
 		if strings.HasPrefix(strings.ToUpper(desc), "TODO") {
 			desc = ""
 		}
-
-		comps = append(comps, Component{
-			ID:           id,
-			Root:         root,
-			Kind:         nonEmptyStr(bm.Role, "subsystem"),
-			Language:     inferBoundsLanguage(absRepo, bm.Paths),
-			Description:  desc,
-			DependsOn:    uniqueSorted(deps),
-			Paths:        uniqueSorted(globs),
-			ManifestFile: ".bounds/manifests/" + e.Name(),
-			Provenance:   ProvenanceToolObserved,
+		result.Subsystems = append(result.Subsystems, BoundsSubsystem{
+			Component: Component{
+				ID:           id,
+				Root:         root,
+				Kind:         nonEmptyStr(bm.Role, "subsystem"),
+				Language:     inferBoundsLanguage(absRepo, paths),
+				Description:  desc,
+				DependsOn:    uniqueSorted(deps),
+				Paths:        uniqueSorted(globs),
+				ManifestFile: rel,
+				Provenance:   ProvenanceToolObserved,
+			},
+			Exposes: bm.Exposes,
 		})
 	}
-	if len(comps) == 0 {
-		return nil, false
+	for _, id := range root.Subsystems {
+		if !loaded[id] {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("listed subsystem %q could not be loaded", id))
+		}
 	}
-	return comps, true
+	return result, nil
 }
 
 // DetectPackageManager inspects lockfiles statically without running any tool.
@@ -215,8 +318,8 @@ func inspectEcosystem(absRepo string) EcosystemInfo {
 				continue
 			}
 			skillMD := filepath.Join(agentsSkillsDir, e.Name(), "SKILL.md")
-			raw, ok := readBoundedRegularFile(absRepo, skillMD)
-			if !ok {
+			raw, err := ReadBoundedRegularFile(absRepo, skillMD, MaxStaticDiscoveryBytes)
+			if err != nil {
 				continue
 			}
 			name, desc := parseSkillFrontmatterBytes(raw)

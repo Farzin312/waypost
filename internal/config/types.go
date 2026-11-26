@@ -1,5 +1,12 @@
 package config
 
+import (
+	"fmt"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
 // Config is the declarative v1 repository contract (.waypost.yaml).
 type Config struct {
 	SchemaVersion string            `yaml:"schema_version" json:"schema_version"`
@@ -8,6 +15,7 @@ type Config struct {
 	Description   string            `yaml:"description,omitempty" json:"description,omitempty"`
 	Extends       string            `yaml:"extends,omitempty" json:"extends,omitempty"`
 	Policy        PolicyConfig      `yaml:"policy,omitempty" json:"policy"`
+	Boundaries    *BoundariesConfig `yaml:"boundaries,omitempty" json:"boundaries,omitempty"`
 	Rules         []Rule            `yaml:"rules,omitempty" json:"rules,omitempty"`
 	Components    []ComponentConfig `yaml:"components,omitempty" json:"components,omitempty"`
 	Pins          []CrossRepoPin    `yaml:"pins,omitempty" json:"pins,omitempty"`
@@ -136,4 +144,75 @@ type ResolvedConfig struct {
 	LocalOverrideApplied bool              `json:"local_override_applied"`
 	LocalOverrideIgnored bool              `json:"local_override_ignored"`
 	RawRootSHA256        string            `json:"raw_root_sha256"`
+}
+
+// BoundariesConfig configures Waypost's built-in polyglot architecture boundary engine,
+// replacing external boundary tools with live zero-cache static import analysis.
+type BoundariesConfig struct {
+	Enabled             *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Mode                string         `yaml:"mode,omitempty" json:"mode,omitempty"` // "enforce" (default) | "warn"
+	NoCycles            *bool          `yaml:"no_cycles,omitempty" json:"no_cycles,omitempty"`
+	EnforceDeclaredDeps *bool          `yaml:"enforce_declared_deps,omitempty" json:"enforce_declared_deps,omitempty"`
+	IgnorePaths         []string       `yaml:"ignore_paths,omitempty" json:"ignore_paths,omitempty"`
+	Rules               []BoundaryRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+// IsEnabled reports whether built-in boundary enforcement is active during verification.
+func (b *BoundariesConfig) IsEnabled() bool {
+	return b != nil && BoolVal(b.Enabled, false)
+}
+
+// EffectiveMode returns "enforce" or "warn" (defaults to "enforce").
+func (b *BoundariesConfig) EffectiveMode() string {
+	if b != nil && b.Mode == "warn" {
+		return "warn"
+	}
+	return "enforce"
+}
+
+// BoundaryRule defines a declarative architectural import constraint between components.
+type BoundaryRule struct {
+	ID                string    `yaml:"id" json:"id"`
+	From              string    `yaml:"from,omitempty" json:"from,omitempty"`                             // component ID or glob pattern
+	Target            string    `yaml:"target,omitempty" json:"target,omitempty"`                         // target component ID or glob for public_entrypoints
+	AllowDependsOn    *[]string `yaml:"allow_depends_on,omitempty" json:"allow_depends_on,omitempty"`     // optional allowlist; non-nil empty slice [] means pure leaf (no imports allowed)
+	DenyDependsOn     []string  `yaml:"deny_depends_on,omitempty" json:"deny_depends_on,omitempty"`       // denylist of component IDs/globs
+	PublicEntrypoints []string  `yaml:"public_entrypoints,omitempty" json:"public_entrypoints,omitempty"` // allowed target file globs for external importers
+	Reason            string    `yaml:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// UnmarshalYAML preserves the schema's field presence and types. The default YAML
+// decoder would coerce scalars to strings and conflate null with absent lists.
+func (r *BoundaryRule) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: boundary rule must be a mapping", node.Line)
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if value.Kind == yaml.AliasNode {
+			value = value.Alias
+		}
+		switch key {
+		case "id", "from", "target", "reason":
+			if value.Tag != "!!str" || (key != "reason" && strings.TrimSpace(value.Value) == "") {
+				return fmt.Errorf("line %d: boundary rule %s must be a valid string", value.Line, key)
+			}
+		case "allow_depends_on", "deny_depends_on", "public_entrypoints":
+			if value.Kind != yaml.SequenceNode {
+				return fmt.Errorf("line %d: boundary rule %s must be a list of strings", value.Line, key)
+			}
+			for _, item := range value.Content {
+				if item.Kind == yaml.AliasNode {
+					item = item.Alias
+				}
+				if item.Tag != "!!str" {
+					return fmt.Errorf("line %d: boundary rule %s must contain only strings", item.Line, key)
+				}
+			}
+		default:
+			return fmt.Errorf("line %d: unknown boundary rule field %q", node.Content[i].Line, key)
+		}
+	}
+	type plainRule BoundaryRule
+	return node.Decode((*plainRule)(r))
 }

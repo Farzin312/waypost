@@ -404,6 +404,32 @@ func validateSingle(cfg *Config, label string) error {
 			return fmt.Errorf("%s: provider %q requires non-empty tool and command", label, p.ID)
 		}
 	}
+	if bounds := cfg.Boundaries; bounds != nil {
+		if bounds.Mode != "" && bounds.Mode != "enforce" && bounds.Mode != "warn" {
+			return fmt.Errorf("%s: boundaries.mode %q must be %q or %q", label, bounds.Mode, "enforce", "warn")
+		}
+		if err := checkDuplicateIDs(label, "boundary rule", len(bounds.Rules), func(i int) string { return bounds.Rules[i].ID }); err != nil {
+			return err
+		}
+		for _, rule := range bounds.Rules {
+			from := strings.TrimSpace(rule.From) != ""
+			target := strings.TrimSpace(rule.Target) != ""
+			dependencies := rule.AllowDependsOn != nil || rule.DenyDependsOn != nil
+			entrypoints := rule.PublicEntrypoints != nil
+			switch {
+			case dependencies && !from:
+				return fmt.Errorf("%s: boundary rule %q with allow_depends_on or deny_depends_on requires from", label, rule.ID)
+			case entrypoints && !target:
+				return fmt.Errorf("%s: boundary rule %q with public_entrypoints requires target", label, rule.ID)
+			case rule.DenyDependsOn != nil && len(rule.DenyDependsOn) == 0:
+				return fmt.Errorf("%s: boundary rule %q requires a non-empty deny_depends_on list", label, rule.ID)
+			case entrypoints && len(rule.PublicEntrypoints) == 0:
+				return fmt.Errorf("%s: boundary rule %q requires a non-empty public_entrypoints list", label, rule.ID)
+			case !dependencies && !entrypoints:
+				return fmt.Errorf("%s: boundary rule %q requires a dependency or public entrypoint constraint", label, rule.ID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -479,6 +505,8 @@ func mergeConfigs(parent, child Config) Config {
 	}
 	out.Policy.TrustPaths = mergeUniqueStrings(parent.Policy.TrustPaths, child.Policy.TrustPaths)
 
+	out.Boundaries = mergeBoundaries(parent.Boundaries, child.Boundaries)
+
 	out.Rules = mergeByID(parent.Rules, child.Rules, func(r Rule) string { return r.ID })
 	out.Components = mergeByID(parent.Components, child.Components, func(c ComponentConfig) string { return c.ID })
 	out.Pins = mergeByID(parent.Pins, child.Pins, func(p CrossRepoPin) string { return p.ID })
@@ -511,6 +539,31 @@ func mergeConfigs(parent, child Config) Config {
 	}
 
 	return out
+}
+
+func mergeBoundaries(parent, child *BoundariesConfig) *BoundariesConfig {
+	if child == nil {
+		return parent
+	}
+	if parent == nil {
+		parent = &BoundariesConfig{}
+	}
+	out := *parent
+	if child.Enabled != nil {
+		out.Enabled = child.Enabled
+	}
+	if child.Mode != "" {
+		out.Mode = child.Mode
+	}
+	if child.NoCycles != nil {
+		out.NoCycles = child.NoCycles
+	}
+	if child.EnforceDeclaredDeps != nil {
+		out.EnforceDeclaredDeps = child.EnforceDeclaredDeps
+	}
+	out.IgnorePaths = mergeUniqueStrings(parent.IgnorePaths, child.IgnorePaths)
+	out.Rules = mergeByID(parent.Rules, child.Rules, func(r BoundaryRule) string { return r.ID })
+	return &out
 }
 
 func mergeByID[T any](parent, child []T, idFn func(T) string) []T {

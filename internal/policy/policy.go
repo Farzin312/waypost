@@ -3,6 +3,7 @@ package policy
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 
 	"github.com/Farzin312/waypost/internal/compmap"
@@ -21,13 +22,13 @@ type SelectedCheck struct {
 
 // BaseFloor holds the trusted base-branch policy resolved strictly from git.
 type BaseFloor struct {
-	Enforced                 bool
-	Loaded                   bool
-	BaseConfig               *config.ResolvedConfig
-	RequireFrozenLockInCI    bool
-	FailClosedOnUnmapped     bool
-	AllowedProviderCommands  map[string]string
-	LoadError                string
+	Enforced                bool
+	Loaded                  bool
+	BaseConfig              *config.ResolvedConfig
+	RequireFrozenLockInCI   bool
+	FailClosedOnUnmapped    bool
+	AllowedProviderCommands map[string]string
+	LoadError               string
 }
 
 // LoadBaseFloor resolves the trusted target base branch's .waypost.yaml and all of
@@ -107,21 +108,24 @@ func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *g
 // PlanResult captures policy authority decisions, trust-boundary escalations,
 // base-branch policy floor enforcement, and the final check execution plan.
 type PlanResult struct {
-	TrustBoundaryTriggered bool            `json:"trust_boundary_triggered"`
-	PolicyFloorEnforced    bool            `json:"policy_floor_enforced"`
-	FullRepoEscalated      bool            `json:"full_repo_escalated"`
-	EscalationReasons      []string        `json:"escalation_reasons,omitempty"`
-	TamperingFindings      []string        `json:"tampering_findings,omitempty"`
-	Impact                 compmap.Impact  `json:"impact"`
-	Checks                 []SelectedCheck `json:"checks"`
-	EffectivePolicyDigest  string          `json:"effective_policy_digest"`
+	TrustBoundaryTriggered bool                     `json:"trust_boundary_triggered"`
+	PolicyFloorEnforced    bool                     `json:"policy_floor_enforced"`
+	FullRepoEscalated      bool                     `json:"full_repo_escalated"`
+	EscalationReasons      []string                 `json:"escalation_reasons,omitempty"`
+	TamperingFindings      []string                 `json:"tampering_findings,omitempty"`
+	Impact                 compmap.Impact           `json:"impact"`
+	Checks                 []SelectedCheck          `json:"checks"`
+	EffectivePolicyDigest  string                   `json:"effective_policy_digest"`
+	EffectiveBoundaries    *config.BoundariesConfig `json:"-"`
 }
 
 // Plan determines which checks must run under the active policy, trusted BaseFloor, and mode.
 func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, cm *compmap.Map, snap *gitdiff.Snapshot, runAll bool) (*PlanResult, error) {
 	cfg := resolved.Effective
+	effectiveBoundaries := cfg.Boundaries
 	res := &PlanResult{
 		EffectivePolicyDigest: resolved.PolicyDigest,
+		EffectiveBoundaries:   effectiveBoundaries,
 	}
 
 	trustPaths := append([]string{
@@ -197,6 +201,65 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 			}
 		}
 
+		// Enforce trusted base architecture boundary policy floor so PRs cannot weaken or delete boundary rules.
+		if baseEff.Boundaries.IsEnabled() {
+			if effectiveBoundaries == nil {
+				effectiveBoundaries = &config.BoundariesConfig{}
+			} else {
+				copy := *effectiveBoundaries
+				copy.Rules = slices.Clone(copy.Rules)
+				effectiveBoundaries = &copy
+			}
+			for _, exclusion := range effectiveBoundaries.IgnorePaths {
+				if !slices.Contains(baseEff.Boundaries.IgnorePaths, exclusion) {
+					res.TamperingFindings = append(res.TamperingFindings,
+						fmt.Sprintf("PR added boundaries.ignore_paths exclusion %q; trusted base exclusions enforced", exclusion))
+				}
+			}
+			effectiveBoundaries.IgnorePaths = baseEff.Boundaries.IgnorePaths
+
+			if !effectiveBoundaries.IsEnabled() {
+				res.TamperingFindings = append(res.TamperingFindings,
+					"PR disabled built-in architecture boundaries; base boundary policy remains enforced")
+				effectiveBoundaries.Enabled = config.BoolPtr(true)
+			}
+			if baseEff.Boundaries.EffectiveMode() == "enforce" && effectiveBoundaries.EffectiveMode() != "enforce" {
+				res.TamperingFindings = append(res.TamperingFindings,
+					"PR downgraded boundaries.mode from enforce to warn; enforce mode remains active")
+				effectiveBoundaries.Mode = "enforce"
+			}
+			if config.BoolVal(baseEff.Boundaries.NoCycles, true) && !config.BoolVal(effectiveBoundaries.NoCycles, true) {
+				res.TamperingFindings = append(res.TamperingFindings,
+					"PR disabled boundaries.no_cycles; cycle enforcement remains active")
+				effectiveBoundaries.NoCycles = config.BoolPtr(true)
+			}
+			if config.BoolVal(baseEff.Boundaries.EnforceDeclaredDeps, false) && !config.BoolVal(effectiveBoundaries.EnforceDeclaredDeps, false) {
+				res.TamperingFindings = append(res.TamperingFindings,
+					"PR disabled boundaries.enforce_declared_deps; declared dependency boundary enforcement remains active")
+				effectiveBoundaries.EnforceDeclaredDeps = config.BoolPtr(true)
+			}
+			headRuleIdx := make(map[string]int, len(effectiveBoundaries.Rules))
+			for i, r := range effectiveBoundaries.Rules {
+				headRuleIdx[r.ID] = i
+			}
+			var changedHeadRules []config.BoundaryRule
+			for _, baseRule := range baseEff.Boundaries.Rules {
+				if idx, ok := headRuleIdx[baseRule.ID]; !ok {
+					res.TamperingFindings = append(res.TamperingFindings,
+						fmt.Sprintf("boundary rule %q was removed in PR; enforced from base policy floor", baseRule.ID))
+					effectiveBoundaries.Rules = append(effectiveBoundaries.Rules, baseRule)
+				} else if !reflect.DeepEqual(baseRule, effectiveBoundaries.Rules[idx]) {
+					res.TamperingFindings = append(res.TamperingFindings,
+						fmt.Sprintf("boundary rule %q was modified in PR; trusted base rule enforced", baseRule.ID))
+					changedHeadRules = append(changedHeadRules, effectiveBoundaries.Rules[idx])
+					effectiveBoundaries.Rules[idx] = baseRule
+				}
+			}
+			// A replacement can add constraints. Evaluate it alongside the restored
+			// floor rule so a stricter PR rule still applies to the PR's components.
+			effectiveBoundaries.Rules = append(effectiveBoundaries.Rules, changedHeadRules...)
+		}
+
 		if len(res.TamperingFindings) > 0 {
 			res.TrustBoundaryTriggered = true
 			res.FullRepoEscalated = true
@@ -204,10 +267,13 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 		}
 	}
 
-	// Recompute effective policy digest over the actually enforced check set.
+	res.EffectiveBoundaries = effectiveBoundaries
+
+	// Recompute effective policy digest over the actually enforced check & boundary set.
 	enforcedCfg := cfg
 	enforcedCfg.Checks = effectiveChecks
 	enforcedCfg.Policy.TrustPaths = trustPaths
+	enforcedCfg.Boundaries = effectiveBoundaries
 	if d, err := config.ComputeDigest(enforcedCfg); err == nil {
 		res.EffectivePolicyDigest = d
 	}

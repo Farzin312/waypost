@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Farzin312/waypost/internal/archgraph"
+	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/lockfile"
 	"github.com/Farzin312/waypost/internal/remote"
 	"github.com/Farzin312/waypost/internal/verify"
@@ -20,13 +22,25 @@ import (
 )
 
 // validateAgainstSchema validates a parsed JSON/YAML value against our Draft 2020-12
-// JSON Schema subset (type, const, enum, pattern, required, properties, additionalProperties, items, minLength, minimum).
+// JSON Schema subset exercised by the Waypost schemas.
 func validateAgainstSchema(schema map[string]any, val any, path string) []string {
 	var errs []string
 	if path == "" {
 		path = "$"
 	}
 
+	if alternatives, ok := schema["anyOf"].([]any); ok {
+		matched := false
+		for _, candidate := range alternatives {
+			if len(validateAgainstSchema(candidate.(map[string]any), val, path)) == 0 {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			errs = append(errs, fmt.Sprintf("%s: no anyOf branch matched", path))
+		}
+	}
 	if c, ok := schema["const"]; ok {
 		if fmt.Sprint(val) != fmt.Sprint(c) {
 			errs = append(errs, fmt.Sprintf("%s: got %v, want const %v", path, val, c))
@@ -45,6 +59,17 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 		}
 	}
 
+	if reqs, ok := schema["required"].([]any); ok {
+		if object, ok := val.(map[string]any); ok {
+			for _, r := range reqs {
+				key := r.(string)
+				if _, exists := object[key]; !exists {
+					errs = append(errs, fmt.Sprintf("%s: missing required property %q", path, key))
+				}
+			}
+		}
+	}
+
 	if typ, ok := schema["type"].(string); ok {
 		switch typ {
 		case "object":
@@ -52,11 +77,15 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			if !ok {
 				return append(errs, fmt.Sprintf("%s: expected object, got %T", path, val))
 			}
-			if reqs, ok := schema["required"].([]any); ok {
-				for _, r := range reqs {
-					rk := r.(string)
-					if _, exists := m[rk]; !exists {
-						errs = append(errs, fmt.Sprintf("%s: missing required property %q", path, rk))
+
+			if dependencies, ok := schema["dependentRequired"].(map[string]any); ok {
+				for field, raw := range dependencies {
+					if _, present := m[field]; present {
+						for _, dependency := range raw.([]any) {
+							if _, found := m[dependency.(string)]; !found {
+								errs = append(errs, fmt.Sprintf("%s: %q requires %q", path, field, dependency))
+							}
+						}
 					}
 				}
 			}
@@ -76,6 +105,9 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			arr, ok := val.([]any)
 			if !ok {
 				return append(errs, fmt.Sprintf("%s: expected array, got %T", path, val))
+			}
+			if minimum, ok := schema["minItems"].(float64); ok && len(arr) < int(minimum) {
+				errs = append(errs, fmt.Sprintf("%s: length %d < minItems %g", path, len(arr), minimum))
 			}
 			if itemSchema, ok := schema["items"].(map[string]any); ok {
 				for i, item := range arr {
@@ -506,4 +538,211 @@ func runGitOutput(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
 	}
 	return string(out)
+}
+
+func TestBuiltInBoundariesVerifyAndBaseFloorTamperingProtection(t *testing.T) {
+	repoDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(repoDir, "tsconfig.json"), `{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}`)
+	mustWriteFile(t, filepath.Join(repoDir, "src", "ui", "btn.ts"), `export const Btn = 1;`)
+	mustWriteFile(t, filepath.Join(repoDir, "src", "chat", "screen.ts"), `import { Btn } from "@/ui/btn"; export const s = Btn;`)
+	mustWriteFile(t, filepath.Join(repoDir, ".waypost.yaml"), `schema_version: "1"
+name: boundaries-demo
+extends: builtin:base@1.0.0
+boundaries:
+  enabled: true
+  mode: enforce
+  no_cycles: true
+  rules:
+    - id: ui-no-chat
+      from: ui
+      deny_depends_on: ["chat"]
+      reason: "UI primitives cannot import feature modules"
+components:
+  - id: ui
+    root: src/ui
+    paths: ["src/ui/**"]
+  - id: chat
+    root: src/chat
+    paths: ["src/chat/**"]
+    depends_on: ["ui"]
+`)
+
+	var out, errBuf bytes.Buffer
+	if code := Run([]string{"upgrade", "--dir", repoDir, "--apply"}, &out, &errBuf); code != 0 {
+		t.Fatalf("upgrade failed: %s", errBuf.String())
+	}
+	runGitCmd(t, repoDir, "init")
+	runGitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	runGitCmd(t, repoDir, "config", "user.name", "Test")
+	runGitCmd(t, repoDir, "add", ".")
+	runGitCmd(t, repoDir, "commit", "-m", "base")
+	baseSHA := strings.TrimSpace(runGitOutput(t, repoDir, "rev-parse", "HEAD"))
+
+	// Clean base passes built-in waypost-boundaries check!
+	out.Reset()
+	errBuf.Reset()
+	if code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--all", "--format", "json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("clean verify failed (%d): %s\n%s", code, errBuf.String(), out.String())
+	}
+	var cleanRec verify.Receipt
+	if err := json.Unmarshal(out.Bytes(), &cleanRec); err != nil {
+		t.Fatalf("parse receipt: %v", err)
+	}
+	if len(cleanRec.Checks) != 1 || cleanRec.Checks[0].ID != "waypost-boundaries" || cleanRec.Checks[0].Status != verify.StatusPass {
+		t.Fatalf("expected built-in waypost-boundaries PASS, got %+v", cleanRec.Checks)
+	}
+
+	// PR introduces a forbidden ui -> chat import AND tries to downgrade boundaries.mode to warn!
+	mustWriteFile(t, filepath.Join(repoDir, "src", "ui", "btn.ts"), `import { s } from "@/chat/screen"; export const Btn = s;`)
+	mustWriteFile(t, filepath.Join(repoDir, ".waypost.yaml"), `schema_version: "1"
+name: boundaries-demo
+extends: builtin:base@1.0.0
+boundaries:
+  enabled: true
+  mode: warn
+  no_cycles: false
+  rules: []
+components:
+  - id: ui
+    root: src/ui
+    paths: ["src/ui/**"]
+  - id: chat
+    root: src/chat
+    paths: ["src/chat/**"]
+    depends_on: ["ui"]
+`)
+	out.Reset()
+	errBuf.Reset()
+	if code := Run([]string{"upgrade", "--dir", repoDir, "--apply"}, &out, &errBuf); code != 0 {
+		t.Fatalf("PR upgrade failed: %s", errBuf.String())
+	}
+	runGitCmd(t, repoDir, "add", ".")
+	runGitCmd(t, repoDir, "commit", "-m", "pr-break-boundary")
+
+	// CI mode MUST detect boundary tampering, enforce base rule ui-no-chat + no_cycles, and FAIL!
+	out.Reset()
+	errBuf.Reset()
+	code := Run([]string{"verify", "--dir", repoDir, "--mode", "ci", "--frozen", "--base", baseSHA, "--format", "json"}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("expected CI verify to FAIL on forbidden import + tampered boundary policy; got PASS:\n%s", out.String())
+	}
+	var failRec verify.Receipt
+	if err := json.Unmarshal(out.Bytes(), &failRec); err != nil {
+		t.Fatalf("parse fail receipt: %v", err)
+	}
+	if len(failRec.Policy.TamperingFindings) < 2 {
+		t.Fatalf("expected boundary tampering findings, got %+v", failRec.Policy.TamperingFindings)
+	}
+	if failRec.Summary.Failed == 0 {
+		t.Fatalf("expected failed check count > 0, got %+v", failRec.Summary)
+	}
+}
+
+func TestBoundaryRuleJSONSchemaConformance(t *testing.T) {
+	schema := loadJSONSchema(t, filepath.Join("..", "..", "schemas", "waypost.v1.schema.json"))
+	for _, tc := range []struct {
+		name, rule string
+		valid      bool
+	}{
+		{"allow-list", "from: app, allow_depends_on: [api]", true},
+		{"pure-leaf", "from: api, allow_depends_on: []", true},
+		{"deny-list", "from: app, deny_depends_on: [internal]", true},
+		{"entrypoints", "target: api, public_entrypoints: [src/api/index.ts]", true},
+		{"entrypoints-with-caller-scope", "from: 'app-*', target: api, public_entrypoints: [src/api/index.ts]", true},
+		{"combined", "from: app, allow_depends_on: [api], target: api, public_entrypoints: [src/api/index.ts]", true},
+		{"id-only", "", false},
+		{"selector-only", "from: app", false},
+		{"target-only", "target: api", false},
+		{"deny-without-from", "target: api, deny_depends_on: [internal]", false},
+		{"allow-without-from-even-with-public-rule", "allow_depends_on: [], target: api, public_entrypoints: [index.ts]", false},
+		{"entrypoints-without-target", "from: app, deny_depends_on: [internal], public_entrypoints: [index.ts]", false},
+		{"empty-entrypoints", "target: api, public_entrypoints: []", false},
+		{"empty-deny-list", "from: app, deny_depends_on: []", false},
+		{"blank-from", "from: '  ', deny_depends_on: [internal]", false},
+		{"blank-optional-target", "from: app, allow_depends_on: [], target: ''", false},
+		{"null-allow", "from: app, allow_depends_on: null, deny_depends_on: [internal]", false},
+		{"numeric-target", "target: 123, public_entrypoints: [index.ts]", false},
+		{"non-string-deny-entry", "from: app, deny_depends_on: [1]", false},
+		{"unknown-field", "from: app, allow_depends_on: [], unknown: true", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf("schema_version: '1'\nboundaries:\n  rules:\n    - {id: rule, %s}\n", tc.rule))
+			var yamlDoc any
+			if err := yaml.Unmarshal(raw, &yamlDoc); err != nil {
+				t.Fatal(err)
+			}
+			schemaErrors := validateAgainstSchema(schema, yamlDoc, "")
+			_, configErr := config.ParseBytes(raw, "boundary conformance fixture")
+			if (len(schemaErrors) == 0) != tc.valid || (configErr == nil) != tc.valid {
+				t.Fatalf("want valid=%t, schema errors=%v, config error=%v", tc.valid, schemaErrors, configErr)
+			}
+		})
+	}
+}
+
+func TestGraphChangedRejectsUnknownBase(t *testing.T) {
+	dir := t.TempDir()
+	runGitCmd(t, dir, "init", "-b", "main")
+	runGitCmd(t, dir, "config", "user.name", "Test")
+	runGitCmd(t, dir, "config", "user.email", "test@example.com")
+	mustWriteFile(t, filepath.Join(dir, "app.ts"), "export const app = 1;")
+	runGitCmd(t, dir, "add", ".")
+	runGitCmd(t, dir, "commit", "-m", "base")
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"graph", "--dir", dir, "--changed", "--base", "ref-that-does-not-exist", "--format", "json"}, &stdout, &stderr); code != 1 ||
+		!strings.Contains(stderr.String(), "unable to resolve base ref") || stdout.Len() != 0 {
+		t.Fatalf("invalid graph base: exit=%d, stdout=%q, stderr=%q", code, &stdout, &stderr)
+	}
+}
+
+func TestGraphCheckBoundariesReportsIncompleteScans(t *testing.T) {
+	for mode, want := range map[string]int{"enforce": 1, "warn": 0} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			mustWriteFile(t, filepath.Join(dir, config.ConfigFileName), fmt.Sprintf("schema_version: '1'\nboundaries: {enabled: true, mode: %s}\n", mode))
+			mustWriteFile(t, filepath.Join(dir, "oversized.ts"), strings.Repeat(" ", 1024*1024+1))
+			var stdout, stderr bytes.Buffer
+			if code := Run([]string{"graph", "--dir", dir, "--check-boundaries", "--format", "json"}, &stdout, &stderr); code != want {
+				t.Fatalf("exit=%d, want %d, stderr=%q", code, want, &stderr)
+			}
+			var graph archgraph.Report
+			if err := json.Unmarshal(stdout.Bytes(), &graph); err != nil {
+				t.Fatal(err)
+			}
+			if graph.FilesScanned != 0 || len(graph.ScanErrors) != 1 || len(graph.Violations) != 1 ||
+				graph.Violations[0].RuleID != "incomplete-scan" || (graph.Violations[0].Severity == "error") != (mode == "enforce") {
+				t.Fatalf("incomplete scan was not reported: %+v", graph)
+			}
+		})
+	}
+}
+
+func TestInitFromBoundsSurfacesSymbolMigrationWarnings(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, ".bounds/manifests/api.yaml"), "name: api\npaths: [src/api]\nexposes: [{name: openAPI, kind: function}]\n")
+	mustWriteFile(t, filepath.Join(dir, "src/api/index.ts"), "export function openAPI() {}")
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"init", "--dir", dir, "--preset", "base", "--from-bounds"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("migration failed: %s", &stderr)
+	}
+	if !strings.Contains(stdout.String(), `Warning: subsystem "api" has symbol-level exposes restrictions`) {
+		t.Fatalf("warning missing from CLI output: %s", &stdout)
+	}
+	res, err := config.Load(dir, config.LoadOptions{})
+	if err != nil || !res.Effective.Boundaries.IsEnabled() || len(res.Effective.Boundaries.Rules) != 1 ||
+		res.Effective.Boundaries.Rules[0].PublicEntrypoints[0] != "src/api/index.ts" {
+		t.Fatalf("generated policy failed to load public entrypoints: %+v, %v", res, err)
+	}
+}
+
+func TestPolyglotExampleFrozenLock(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "polyglot-native")
+	res, err := config.Load(dir, config.LoadOptions{Mode: "ci", Offline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock := lockfile.Verify(dir, res); !lock.Valid {
+		t.Fatalf("example's frozen lock is invalid: %v", lock.Mismatches)
+	}
 }
