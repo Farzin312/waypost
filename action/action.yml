@@ -22,7 +22,7 @@ inputs:
     required: false
     default: ".waypost/receipt.md"
   go-version:
-    description: "Go version to build waypost when not pre-installed."
+    description: "Go version to install when waypost is not pre-installed."
     required: false
     default: "1.26"
   waypost-ref:
@@ -40,33 +40,62 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Ensure waypost binary
+    - name: Check pre-installed waypost
+      id: check_bin
       shell: bash
       run: |
         if command -v waypost >/dev/null 2>&1; then
-          echo "Using pre-installed $(command -v waypost)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
         else
-          echo "Installing github.com/Farzin312/waypost/cmd/waypost@${{ inputs.waypost-ref }}"
-          go install "github.com/Farzin312/waypost/cmd/waypost@${{ inputs.waypost-ref }}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "found=false" >> "$GITHUB_OUTPUT"
         fi
+
+    - name: Set up Go
+      if: steps.check_bin.outputs.found != 'true'
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Install waypost binary
+      if: steps.check_bin.outputs.found != 'true'
+      shell: bash
+      env:
+        WAYPOST_REF: ${{ inputs.waypost-ref }}
+      run: |
+        echo "Installing github.com/Farzin312/waypost/cmd/waypost@${WAYPOST_REF}"
+        go install "github.com/Farzin312/waypost/cmd/waypost@${WAYPOST_REF}"
+        INSTALL_BIN="$(go env GOBIN)"
+        if [ -z "$INSTALL_BIN" ]; then
+          INSTALL_BIN="$(go env GOPATH)/bin"
+        fi
+        echo "$INSTALL_BIN" >> "$GITHUB_PATH"
 
     - name: Run waypost verify (CI authority)
       id: run
       shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_FROZEN: ${{ inputs.frozen }}
+        INPUT_ALL: ${{ inputs.all }}
+        INPUT_RECEIPT_PATH: ${{ inputs.receipt-path }}
+        INPUT_MARKDOWN_PATH: ${{ inputs.markdown-path }}
       run: |
-        BASE_REF="${{ inputs.base }}"
+        # Remove any stale receipt/markdown from earlier steps so outcome always reflects this run.
+        rm -f "$INPUT_RECEIPT_PATH" "$INPUT_MARKDOWN_PATH"
+
+        BASE_REF="$INPUT_BASE"
         if [ -z "$BASE_REF" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
           BASE_REF="origin/${GITHUB_BASE_REF}"
         fi
-        ARGS=(verify --mode ci --receipt "${{ inputs.receipt-path }}" --markdown "${{ inputs.markdown-path }}")
+
+        ARGS=(verify --mode ci --receipt "$INPUT_RECEIPT_PATH" --markdown "$INPUT_MARKDOWN_PATH")
         if [ -n "$BASE_REF" ]; then
           ARGS+=(--base "$BASE_REF")
         fi
-        if [ "${{ inputs.frozen }}" = "true" ]; then
+        if [ "$INPUT_FROZEN" = "true" ]; then
           ARGS+=(--frozen)
         fi
-        if [ "${{ inputs.all }}" = "true" ]; then
+        if [ "$INPUT_ALL" = "true" ]; then
           ARGS+=(--all)
         fi
 
@@ -75,13 +104,13 @@ runs:
         EXIT_CODE=$?
         set -e
 
-        if [ -f "${{ inputs.markdown-path }}" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-          cat "${{ inputs.markdown-path }}" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$INPUT_MARKDOWN_PATH" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          cat "$INPUT_MARKDOWN_PATH" >> "$GITHUB_STEP_SUMMARY"
         fi
 
         OUTCOME="FAIL"
-        if [ -f "${{ inputs.receipt-path }}" ]; then
-          OUTCOME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["summary"]["outcome"])' "${{ inputs.receipt-path }}" 2>/dev/null || echo "FAIL")
+        if [ -f "$INPUT_RECEIPT_PATH" ]; then
+          OUTCOME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["summary"]["outcome"])' "$INPUT_RECEIPT_PATH" 2>/dev/null || echo "FAIL")
         fi
         echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
         exit "$EXIT_CODE"

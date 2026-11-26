@@ -2,6 +2,7 @@ package policy
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/Farzin312/waypost/internal/compmap"
@@ -17,27 +18,101 @@ type SelectedCheck struct {
 	FromBase bool         `json:"from_base,omitempty"`
 }
 
+// BaseFloor holds the trusted base-branch policy resolved strictly from git.
+type BaseFloor struct {
+	Enforced                 bool
+	Loaded                   bool
+	BaseConfig               *config.ResolvedConfig
+	RequireFrozenLockInCI    bool
+	FailClosedOnUnmapped     bool
+	AllowedProviderCommands  map[string]string
+	LoadError                string
+}
+
+// LoadBaseFloor resolves the trusted target base branch's .waypost.yaml and all of
+// its file-based `extends` ancestors strictly from `git show <TargetSHA>:<path>`
+// (never touching the PR worktree). In CI mode, this runs BEFORE planning, provider
+// execution, or check execution so a PR cannot disable its own CI policy floor.
+func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *gitdiff.Snapshot) BaseFloor {
+	bf := BaseFloor{
+		RequireFrozenLockInCI: config.BoolVal(headRes.Effective.Policy.RequireFrozenLockInCI, true),
+		FailClosedOnUnmapped:  config.BoolVal(headRes.Effective.Policy.FailClosedOnUnmapped, true),
+	}
+	if mode != "ci" || snap == nil || !snap.IsGitRepo {
+		return bf
+	}
+	ref := snap.TargetSHA
+	if ref == "" {
+		ref = snap.BaseSHA
+	}
+	if ref == "" {
+		return bf
+	}
+
+	reader := func(relPath string) ([]byte, bool, error) {
+		return gitdiff.ReadFileAtRef(repoDir, ref, relPath)
+	}
+	baseRaw, exists, err := reader(config.ConfigFileName)
+	if err != nil {
+		bf.LoadError = fmt.Sprintf("unable to read base policy floor at %s: %v", ref, err)
+		return bf
+	}
+	if !exists {
+		return bf
+	}
+
+	baseRes, loadErr := config.Load(repoDir, config.LoadOptions{
+		Mode:            "ci",
+		OverrideRootRaw: baseRaw,
+		OverrideLabel:   ref + ":" + config.ConfigFileName,
+		RepoFileReader:  reader,
+	})
+	if loadErr != nil {
+		bf.LoadError = fmt.Sprintf("base policy floor at %s failed to resolve: %v", ref, loadErr)
+		return bf
+	}
+
+	bf.Loaded = true
+	bf.BaseConfig = baseRes
+	bf.Enforced = config.BoolVal(baseRes.Effective.Policy.EnforceBaseFloorInCI, true)
+	if bf.Enforced {
+		// Base policy controls take precedence over PR attempts to weaken CI enforcement.
+		if config.BoolVal(baseRes.Effective.Policy.RequireFrozenLockInCI, true) {
+			bf.RequireFrozenLockInCI = true
+		}
+		if config.BoolVal(baseRes.Effective.Policy.FailClosedOnUnmapped, true) {
+			bf.FailClosedOnUnmapped = true
+		}
+		bf.AllowedProviderCommands = make(map[string]string)
+		for _, p := range baseRes.Effective.Providers {
+			if p.Authorized {
+				bf.AllowedProviderCommands[p.ID] = p.Command
+			}
+		}
+	}
+	return bf
+}
+
 // PlanResult captures policy authority decisions, trust-boundary escalations,
 // base-branch policy floor enforcement, and the final check execution plan.
 type PlanResult struct {
-	TrustBoundaryTriggered bool             `json:"trust_boundary_triggered"`
-	PolicyFloorEnforced    bool             `json:"policy_floor_enforced"`
-	FullRepoEscalated      bool             `json:"full_repo_escalated"`
-	EscalationReasons      []string         `json:"escalation_reasons,omitempty"`
-	TamperingFindings      []string         `json:"tampering_findings,omitempty"`
-	Impact                 compmap.Impact   `json:"impact"`
-	Checks                 []SelectedCheck  `json:"checks"`
+	TrustBoundaryTriggered bool            `json:"trust_boundary_triggered"`
+	PolicyFloorEnforced    bool            `json:"policy_floor_enforced"`
+	FullRepoEscalated      bool            `json:"full_repo_escalated"`
+	EscalationReasons      []string        `json:"escalation_reasons,omitempty"`
+	TamperingFindings      []string        `json:"tampering_findings,omitempty"`
+	Impact                 compmap.Impact  `json:"impact"`
+	Checks                 []SelectedCheck `json:"checks"`
+	EffectivePolicyDigest  string          `json:"effective_policy_digest"`
 }
 
-// Plan determines which checks must run under the active policy and mode.
-// In "ci" mode, it enforces a base-branch policy floor via `git show <base>:.waypost.yaml`,
-// escalates on trust-boundary edits (evaluating both sides of renames & deletions),
-// and fails closed to the full repo gate on unmapped paths or missing merge-bases.
-func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map, snap *gitdiff.Snapshot, runAll bool) (*PlanResult, error) {
+// Plan determines which checks must run under the active policy, trusted BaseFloor, and mode.
+func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, cm *compmap.Map, snap *gitdiff.Snapshot, runAll bool) (*PlanResult, error) {
 	cfg := resolved.Effective
-	res := &PlanResult{}
+	res := &PlanResult{
+		EffectivePolicyDigest: resolved.PolicyDigest,
+	}
 
-	// Collect effective trust paths (global + component-level + hardcoded policy files).
 	trustPaths := append([]string{
 		config.ConfigFileName,
 		".waypost.lock",
@@ -53,62 +128,78 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 		effectiveByID[c.ID] = c
 	}
 
-	// Base-branch policy floor in CI mode.
-	if mode == "ci" && config.BoolVal(cfg.Policy.EnforceBaseFloorInCI, true) && snap != nil && snap.IsGitRepo && snap.BaseSHA != "" {
-		baseRaw, exists, err := gitdiff.ReadFileAtRef(repoDir, snap.BaseSHA, config.ConfigFileName)
-		if err != nil {
-			res.FullRepoEscalated = true
-			res.EscalationReasons = append(res.EscalationReasons, fmt.Sprintf("unable to read base policy floor: %v", err))
-		} else if exists {
-			baseRes, loadErr := config.Load(repoDir, config.LoadOptions{
-				Mode:            "ci",
-				OverrideRootRaw: baseRaw,
-				OverrideLabel:   snap.BaseSHA + ":" + config.ConfigFileName,
-			})
-			if loadErr != nil {
-				res.FullRepoEscalated = true
-				res.EscalationReasons = append(res.EscalationReasons, fmt.Sprintf("base policy floor failed to parse: %v", loadErr))
-			} else {
-				res.PolicyFloorEnforced = true
-				// Union base trust paths so a PR cannot remove itself from trust_paths.
-				trustPaths = append(trustPaths, baseRes.Effective.Policy.TrustPaths...)
+	baseEnforcedIDs := make(map[string]bool)
 
-				// Detect weakening or removal of required base checks.
-				for _, baseChk := range baseRes.Effective.Checks {
-					if !baseChk.IsRequired() {
-						continue
-					}
-					headChk, ok := effectiveByID[baseChk.ID]
-					if !ok {
-						res.TamperingFindings = append(res.TamperingFindings,
-							fmt.Sprintf("required base check %q was removed or disabled in PR; enforced from base policy floor", baseChk.ID))
-						effectiveChecks = append(effectiveChecks, baseChk)
-						effectiveByID[baseChk.ID] = baseChk
-						continue
-					}
-					if !headChk.IsRequired() {
-						res.TamperingFindings = append(res.TamperingFindings,
-							fmt.Sprintf("required base check %q was downgraded to optional in PR; enforced as required", baseChk.ID))
-						headChk.Required = config.BoolPtr(true)
-						replaceCheck(effectiveChecks, headChk)
-						effectiveByID[headChk.ID] = headChk
-					}
-					if headChk.Command != baseChk.Command {
-						res.TamperingFindings = append(res.TamperingFindings,
-							fmt.Sprintf("required base check %q command changed in PR (%q -> %q); trust-boundary review required",
-								baseChk.ID, baseChk.Command, headChk.Command))
-					}
-				}
-				if len(res.TamperingFindings) > 0 {
-					res.TrustBoundaryTriggered = true
-					res.FullRepoEscalated = true
-					res.EscalationReasons = append(res.EscalationReasons, "base-branch policy floor detected check tampering or modification")
-				}
+	if bf.LoadError != "" {
+		res.FullRepoEscalated = true
+		res.EscalationReasons = append(res.EscalationReasons, bf.LoadError)
+	}
+
+	// Enforce trusted base-branch policy floor in CI mode.
+	if mode == "ci" && bf.Loaded && bf.Enforced && bf.BaseConfig != nil {
+		res.PolicyFloorEnforced = true
+		baseEff := bf.BaseConfig.Effective
+
+		// Retain both global AND component trust paths from the trusted base policy.
+		trustPaths = append(trustPaths, baseEff.Policy.TrustPaths...)
+		for _, bc := range baseEff.Components {
+			trustPaths = append(trustPaths, bc.TrustPaths...)
+		}
+
+		// Detect PR weakening of CI policy flags.
+		if !config.BoolVal(cfg.Policy.EnforceBaseFloorInCI, true) {
+			res.TamperingFindings = append(res.TamperingFindings,
+				"PR attempted to set enforce_base_floor_in_ci=false; base policy floor remains enforced")
+		}
+		if config.BoolVal(baseEff.Policy.RequireFrozenLockInCI, true) && !config.BoolVal(cfg.Policy.RequireFrozenLockInCI, true) {
+			res.TamperingFindings = append(res.TamperingFindings,
+				"PR attempted to set require_frozen_lock_in_ci=false; base policy floor requires frozen lock")
+		}
+		if config.BoolVal(baseEff.Policy.FailClosedOnUnmapped, true) && !config.BoolVal(cfg.Policy.FailClosedOnUnmapped, true) {
+			res.TamperingFindings = append(res.TamperingFindings,
+				"PR attempted to set fail_closed_on_unmapped=false; base policy floor enforces fail-closed unmapped escalation")
+		}
+
+		// Compare complete check definitions for every required base check.
+		// If removed, downgraded, or altered in command/workdir/requires_bin/timeout/scope,
+		// restore the trusted base check definition so the PR cannot substitute or weaken it.
+		for _, baseChk := range baseEff.Checks {
+			if !baseChk.IsRequired() {
+				continue
 			}
+			headChk, ok := effectiveByID[baseChk.ID]
+			if !ok {
+				res.TamperingFindings = append(res.TamperingFindings,
+					fmt.Sprintf("required base check %q was removed or disabled in PR; enforced from base policy floor", baseChk.ID))
+				effectiveChecks = append(effectiveChecks, baseChk)
+				effectiveByID[baseChk.ID] = baseChk
+				baseEnforcedIDs[baseChk.ID] = true
+				continue
+			}
+			if !checksEquivalent(baseChk, headChk) {
+				res.TamperingFindings = append(res.TamperingFindings,
+					fmt.Sprintf("required base check %q was modified or weakened in PR; trusted base definition enforced", baseChk.ID))
+				replaceCheck(effectiveChecks, baseChk)
+				effectiveByID[baseChk.ID] = baseChk
+				baseEnforcedIDs[baseChk.ID] = true
+			}
+		}
+
+		if len(res.TamperingFindings) > 0 {
+			res.TrustBoundaryTriggered = true
+			res.FullRepoEscalated = true
+			res.EscalationReasons = append(res.EscalationReasons, "base-branch policy floor detected policy or check tampering")
 		}
 	}
 
-	// Merge-base failure in CI or explicit base: fail closed to full gate.
+	// Recompute effective policy digest over the actually enforced check set.
+	enforcedCfg := cfg
+	enforcedCfg.Checks = effectiveChecks
+	enforcedCfg.Policy.TrustPaths = trustPaths
+	if d, err := config.ComputeDigest(enforcedCfg); err == nil {
+		res.EffectivePolicyDigest = d
+	}
+
 	if snap != nil && snap.MergeBaseError != "" {
 		res.FullRepoEscalated = true
 		res.EscalationReasons = append(res.EscalationReasons, "merge-base unavailable: "+snap.MergeBaseError)
@@ -133,8 +224,8 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 		res.EscalationReasons = append(res.EscalationReasons, fmt.Sprintf("trust-boundary paths modified: %v", trustHits))
 	}
 
-	// Fail closed on unmapped changed paths.
-	if len(res.Impact.UnmappedPaths) > 0 && config.BoolVal(cfg.Policy.FailClosedOnUnmapped, true) {
+	// Fail closed on unmapped changed paths using trusted policy flag.
+	if len(res.Impact.UnmappedPaths) > 0 && bf.FailClosedOnUnmapped {
 		res.FullRepoEscalated = true
 		res.EscalationReasons = append(res.EscalationReasons,
 			fmt.Sprintf("unmapped changed paths escalated to full repo gate: %v", res.Impact.UnmappedPaths))
@@ -145,7 +236,6 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 		res.EscalationReasons = append(res.EscalationReasons, "--all flag requested full repository verification")
 	}
 
-	// Build impacted component set (direct + transitive reverse dependents) and pin checks.
 	impactedComps := make(map[string]bool)
 	for _, id := range res.Impact.DirectComponents {
 		impactedComps[id] = true
@@ -174,29 +264,16 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 		}
 	}
 
-	// Determine check selection.
-	baseAdded := make(map[string]bool)
-	origSet := make(map[string]bool, len(cfg.Checks))
-	for _, c := range cfg.Checks {
-		origSet[c.ID] = true
-	}
-	for _, c := range effectiveChecks {
-		if !origSet[c.ID] {
-			baseAdded[c.ID] = true
-		}
-	}
-
 	for _, chk := range effectiveChecks {
 		sc := SelectedCheck{
 			Check:    chk,
-			FromBase: baseAdded[chk.ID],
+			FromBase: baseEnforcedIDs[chk.ID],
 		}
 		switch {
 		case res.FullRepoEscalated:
 			sc.Selected = true
 			sc.Reason = "full repo verification escalated"
 		case len(changed) == 0 && (snap == nil || !snap.IsGitRepo || snap.BaseSHA == ""):
-			// No git base to scope against: fail closed by running all checks.
 			sc.Selected = true
 			sc.Reason = "no git diff base available; running full check set"
 		case pinChecks[chk.ID]:
@@ -209,7 +286,6 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 			sc.Selected = true
 			sc.Reason = "check targets impacted component"
 		case len(chk.Paths) == 0:
-			// Unscoped global check runs whenever anything changed.
 			if len(changed) > 0 {
 				sc.Selected = true
 				sc.Reason = "global repository check"
@@ -230,6 +306,16 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, cm *compmap.Map
 	sort.Strings(res.EscalationReasons)
 	sort.Strings(res.TamperingFindings)
 	return res, nil
+}
+
+func checksEquivalent(a, b config.Check) bool {
+	return a.Command == b.Command &&
+		a.Workdir == b.Workdir &&
+		a.IsRequired() == b.IsRequired() &&
+		a.TimeoutSeconds == b.TimeoutSeconds &&
+		a.RequiresBin == b.RequiresBin &&
+		reflect.DeepEqual(a.Paths, b.Paths) &&
+		reflect.DeepEqual(a.Components, b.Components)
 }
 
 func checkMatchesComponents(chk config.Check, impacted map[string]bool) bool {

@@ -2,9 +2,12 @@ package upgrade
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -39,8 +42,8 @@ type Plan struct {
 }
 
 // Run computes a reviewable upgrade plan and, when opts.Apply is true, updates
-// .waypost.yaml (if Target changed) and .waypost.lock atomically so git revert
-// remains a clean rollback path.
+// .waypost.yaml (if Target changed) and .waypost.lock using exclusively created
+// temporary files with rollback on error so git revert remains clean.
 func Run(repoDir string, opts Options) (*Plan, error) {
 	cfgPath := filepath.Join(repoDir, config.ConfigFileName)
 	rawBefore, err := os.ReadFile(cfgPath)
@@ -48,13 +51,12 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		return nil, fmt.Errorf("read %s: %w", cfgPath, err)
 	}
 
-	// Always compute canonical CI-mode configs so local overrides never leak into commits.
 	beforeRes, err := config.Load(repoDir, config.LoadOptions{Mode: "ci"})
 	if err != nil {
 		return nil, fmt.Errorf("load current config: %w", err)
 	}
-	prevLock, prevLockDigest, lockErr := lockfile.Read(repoDir)
-	_ = lockErr
+	prevLock, prevLockDigest, _ := lockfile.Read(repoDir)
+	prevLockRaw, _ := os.ReadFile(filepath.Join(repoDir, lockfile.LockFileName))
 
 	rawAfter := rawBefore
 	targetExt := strings.TrimSpace(opts.Target)
@@ -81,6 +83,8 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	newLockSum := sha256.Sum256(newLockBytes)
+	newLockDigestPreview := hex.EncodeToString(newLockSum[:])
 
 	plan := &Plan{
 		Applied:              false,
@@ -89,9 +93,10 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		PreviousPolicyDigest: beforeRes.PolicyDigest,
 		NewPolicyDigest:      afterRes.PolicyDigest,
 		PreviousLockDigest:   prevLockDigest,
+		NewLockDigest:        newLockDigestPreview,
 	}
 
-	// Compare rules.
+	// Compare complete rules.
 	beforeRules := make(map[string]config.Rule)
 	for _, r := range beforeRes.Effective.Rules {
 		beforeRules[r.ID] = r
@@ -114,7 +119,7 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		}
 	}
 
-	// Compare checks.
+	// Compare complete checks (command, workdir, required, timeout, requires_bin, paths, components).
 	beforeChecks := make(map[string]config.Check)
 	for _, c := range beforeRes.Effective.Checks {
 		beforeChecks[c.ID] = c
@@ -127,9 +132,11 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		bc, ok := beforeChecks[id]
 		if !ok {
 			plan.AddedChecks = append(plan.AddedChecks, fmt.Sprintf("%s (%s)", id, ac.Command))
-		} else if bc.Command != ac.Command || bc.IsRequired() != ac.IsRequired() {
-			plan.ChangedChecks = append(plan.ChangedChecks, fmt.Sprintf("%s: %q (req=%v) -> %q (req=%v)",
-				id, bc.Command, bc.IsRequired(), ac.Command, ac.IsRequired()))
+		} else if !checksEqual(bc, ac) {
+			plan.ChangedChecks = append(plan.ChangedChecks,
+				fmt.Sprintf("%s: cmd=%q->%q req=%v->%v timeout=%ds->%ds bin=%q->%q workdir=%q->%q",
+					id, bc.Command, ac.Command, bc.IsRequired(), ac.IsRequired(),
+					bc.TimeoutSeconds, ac.TimeoutSeconds, bc.RequiresBin, ac.RequiresBin, bc.Workdir, ac.Workdir))
 		}
 	}
 	for id := range beforeChecks {
@@ -138,7 +145,7 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		}
 	}
 
-	// Surface permission/execution-authorization deltas explicitly!
+	// Compare complete authorized skills and providers so source/version/tool/command changes surface.
 	prevSkills := make(map[string]lockfile.LockedSkill)
 	prevProvs := make(map[string]lockfile.LockedProvider)
 	if prevLock != nil {
@@ -151,14 +158,16 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 	for _, s := range afterRes.Effective.Skills {
 		prev, ok := prevSkills[s.ID]
-		if s.Authorized && (!ok || !prev.Authorized) {
-			plan.PermissionChanges = append(plan.PermissionChanges, fmt.Sprintf("skill %q enables authorized execution (%s)", s.ID, s.Source))
+		if s.Authorized && (!ok || !prev.Authorized || prev.Source != s.Source || prev.Version != s.Version) {
+			plan.PermissionChanges = append(plan.PermissionChanges,
+				fmt.Sprintf("skill %q authorized execution added/changed (%s@%s)", s.ID, s.Source, s.Version))
 		}
 	}
 	for _, p := range afterRes.Effective.Providers {
 		prev, ok := prevProvs[p.ID]
-		if p.Authorized && (!ok || !prev.Authorized || prev.Command != p.Command) {
-			plan.PermissionChanges = append(plan.PermissionChanges, fmt.Sprintf("provider %q enables/changes authorized command (%s)", p.ID, p.Command))
+		if p.Authorized && (!ok || !prev.Authorized || prev.Tool != p.Tool || prev.Command != p.Command) {
+			plan.PermissionChanges = append(plan.PermissionChanges,
+				fmt.Sprintf("provider %q authorized command added/changed (%s: %s)", p.ID, p.Tool, p.Command))
 		}
 	}
 
@@ -170,50 +179,87 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	sort.Strings(plan.ChangedChecks)
 	sort.Strings(plan.PermissionChanges)
 
-	lockChanged := prevLock == nil || prevLock.PolicyDigest != newLock.PolicyDigest || prevLock.ConfigSHA256 != newLock.ConfigSHA256
-	if !lockChanged && len(prevLock.Chain) == len(newLock.Chain) {
-		for i := range prevLock.Chain {
-			if prevLock.Chain[i] != newLock.Chain[i] {
-				lockChanged = true
-				break
-			}
-		}
-	} else if !lockChanged {
-		lockChanged = true
-	}
-
-	plan.Changed = !bytes.Equal(rawBefore, rawAfter) || lockChanged
+	// Canonical lock comparison ensures version-only or formatting mismatches are always repaired.
+	lockChanged := prevLock == nil || !bytes.Equal(prevLockRaw, newLockBytes)
+	cfgChanged := !bytes.Equal(rawBefore, rawAfter)
+	plan.Changed = cfgChanged || lockChanged
 
 	if opts.Apply && plan.Changed {
-		if !bytes.Equal(rawBefore, rawAfter) {
-			tmp := cfgPath + ".tmp"
-			if err := os.WriteFile(tmp, rawAfter, 0o644); err != nil {
-				return nil, fmt.Errorf("write updated config: %w", err)
-			}
-			if err := os.Rename(tmp, cfgPath); err != nil {
-				_ = os.Remove(tmp)
-				return nil, fmt.Errorf("rename updated config: %w", err)
+		// Stage both files in exclusively created temp files before renaming.
+		var cfgTmp string
+		if cfgChanged {
+			var err error
+			cfgTmp, err = stageTempFile(repoDir, ".waypost-cfg-*.tmp", rawAfter)
+			if err != nil {
+				return nil, err
 			}
 		}
-		newDigest, err := lockfile.Write(repoDir, newLock)
+		lockTmp, err := stageTempFile(repoDir, ".waypost-lock-*.tmp", newLockBytes)
 		if err != nil {
+			if cfgTmp != "" {
+				_ = os.Remove(cfgTmp)
+			}
 			return nil, err
 		}
-		plan.NewLockDigest = newDigest
-		plan.Applied = true
-	} else {
-		// Compute preview digest of lockfile bytes without writing.
-		_ = newLockBytes
-		if prevLockDigest != "" && !lockChanged {
-			plan.NewLockDigest = prevLockDigest
+
+		if cfgTmp != "" {
+			if err := os.Rename(cfgTmp, cfgPath); err != nil {
+				_ = os.Remove(cfgTmp)
+				_ = os.Remove(lockTmp)
+				return nil, fmt.Errorf("publish updated config: %w", err)
+			}
 		}
+		lockPath := filepath.Join(repoDir, lockfile.LockFileName)
+		if err := os.Rename(lockTmp, lockPath); err != nil {
+			_ = os.Remove(lockTmp)
+			// Roll back config file if lock publish failed.
+			if cfgChanged {
+				_ = os.WriteFile(cfgPath, rawBefore, 0o644)
+			}
+			return nil, fmt.Errorf("publish updated lockfile: %w", err)
+		}
+		plan.Applied = true
 	}
 
 	return plan, nil
 }
 
-// replaceExtendsField updates or inserts `extends` in a YAML document while
-// preserving existing field ordering and formatting as cleanly as possible.
+func checksEqual(a, b config.Check) bool {
+	return a.Command == b.Command &&
+		a.Workdir == b.Workdir &&
+		a.IsRequired() == b.IsRequired() &&
+		a.TimeoutSeconds == b.TimeoutSeconds &&
+		a.RequiresBin == b.RequiresBin &&
+		a.Description == b.Description &&
+		reflect.DeepEqual(a.Paths, b.Paths) &&
+		reflect.DeepEqual(a.Components, b.Components)
+}
+
+func stageTempFile(dir, pattern string, content []byte) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	name := f.Name()
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("close temp file: %w", err)
+	}
+	return name, nil
+}
+
+// replaceExtendsField updates or inserts `extends` in a YAML document, safely replacing
+// scalar or alias nodes with a clean scalar string node.
 func replaceExtendsField(raw []byte, newExtends string) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
@@ -226,8 +272,11 @@ func replaceExtendsField(raw []byte, newExtends string) ([]byte, error) {
 	found := false
 	for i := 0; i < len(m.Content)-1; i += 2 {
 		if m.Content[i].Value == "extends" {
-			m.Content[i+1].Value = newExtends
-			m.Content[i+1].Tag = "!!str"
+			m.Content[i+1] = &yaml.Node{
+				Kind:  yaml.ScalarNode,
+				Tag:   "!!str",
+				Value: newExtends,
+			}
 			found = true
 			break
 		}

@@ -23,6 +23,16 @@ const (
 	ProvenanceToolObserved = "tool-observed"
 )
 
+// BuildOptions controls optional external provider execution during component map construction.
+type BuildOptions struct {
+	// AllowProviders must be true (after lock/policy validation) for any authorized
+	// external provider to execute. Defaults to false (safe read-only static inference).
+	AllowProviders bool
+	// AllowedProviderCommands optionally restricts execution in CI mode to exact
+	// provider ID -> command pairs approved by the trusted base policy.
+	AllowedProviderCommands map[string]string
+}
+
 // Component is one node in the repository's "what builds on what" map.
 type Component struct {
 	ID           string   `json:"id"`
@@ -31,7 +41,7 @@ type Component struct {
 	Language     string   `json:"language,omitempty"`
 	Description  string   `json:"description,omitempty"`
 	DependsOn    []string `json:"depends_on,omitempty"`
-	DependedBy   []string `json:"depended_by,omitempty"` // Reverse edges: "what builds on this"
+	DependedBy   []string `json:"depended_by,omitempty"`
 	Entrypoints  []string `json:"entrypoints,omitempty"`
 	TrustPaths   []string `json:"trust_paths,omitempty"`
 	Checks       []string `json:"checks,omitempty"`
@@ -68,28 +78,33 @@ type Impact struct {
 }
 
 var skipDirs = map[string]bool{
-	".git":         true,
-	"node_modules": true,
-	"vendor":       true,
-	".next":        true,
-	".expo":        true,
-	"dist":         true,
-	"build":        true,
-	"Binaries":     true,
-	"Intermediate": true,
-	"Saved":        true,
+	".git":             true,
+	"node_modules":     true,
+	"vendor":           true,
+	".next":            true,
+	".expo":            true,
+	"dist":             true,
+	"build":            true,
+	"Binaries":         true,
+	"Intermediate":     true,
+	"Saved":            true,
 	"DerivedDataCache": true,
-	".venv":        true,
-	"__pycache__":  true,
-	"target":       true,
+	".venv":            true,
+	"__pycache__":      true,
+	"target":           true,
 }
 
-// Build constructs a Component Map by combining:
+// Build constructs a Component Map with safe defaults (providers disabled unless BuildWithOptions enables them).
+func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, error) {
+	return BuildWithOptions(repoDir, cfg, trackedFiles, BuildOptions{})
+}
+
+// BuildWithOptions constructs a Component Map by combining:
 // 1. Safe static manifest inference (no repo code execution),
 // 2. Declared components and pins from effective .waypost.yaml (authoritative overlay),
-// 3. Optional authorized external providers (e.g., `bounds report --json`),
+// 3. Optional authorized external providers ONLY when opts.AllowProviders is true,
 // 4. Reverse-dependency graph ("what builds on what") and coverage-gap audit.
-func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, error) {
+func BuildWithOptions(repoDir string, cfg *config.Config, trackedFiles []string, opts BuildOptions) (*Map, error) {
 	inferred, gaps, err := inferManifests(repoDir)
 	if err != nil {
 		return nil, err
@@ -121,7 +136,6 @@ func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, err
 				Paths:       dc.Paths,
 				Provenance:  ProvenanceDeclared,
 			}
-			// If an inferred component shared this root under a different inferred ID, fold its manifest info in and replace it.
 			if prevID, ok := byRoot[normRoot]; ok && prevID != dc.ID {
 				prev := byID[prevID]
 				if comp.ManifestFile == "" {
@@ -150,11 +164,11 @@ func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, err
 		}
 	}
 
-	// Optional external providers (ONLY when authorized == true).
+	// Optional external providers (ONLY when authorized AND explicitly allowed after lock/policy checks).
 	var provStatuses []ProviderStatus
 	if cfg != nil {
 		for _, p := range cfg.Providers {
-			ps := runProviderIfAuthorized(repoDir, p, byID)
+			ps := runProviderIfAuthorized(repoDir, p, opts, byID)
 			provStatuses = append(provStatuses, ps)
 		}
 	}
@@ -183,7 +197,6 @@ func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, err
 		m.Pins = append([]config.CrossRepoPin(nil), cfg.Pins...)
 	}
 
-	// Audit tracked files to report unmapped paths explicitly (bounded to avoid huge output).
 	if len(trackedFiles) > 0 {
 		for _, f := range trackedFiles {
 			if len(m.OwnersOf(f)) == 0 {
@@ -201,8 +214,6 @@ func Build(repoDir string, cfg *config.Config, trackedFiles []string) (*Map, err
 }
 
 // OwnersOf returns component IDs whose declared/inferred paths match relPath.
-// More specific nested roots take precedence over "." when multiple match, unless
-// explicit path globs were declared.
 func (m *Map) OwnersOf(relPath string) []string {
 	relPath = strings.TrimPrefix(filepath.ToSlash(relPath), "./")
 	var exactMatches []Component
@@ -244,7 +255,6 @@ func (m *Map) ImpactedByPaths(changedPaths []string) Impact {
 		}
 	}
 
-	// Build reverse adjacency for BFS.
 	rev := make(map[string][]string, len(m.Components))
 	for _, c := range m.Components {
 		rev[c.ID] = c.DependedBy
@@ -288,13 +298,17 @@ func (m *Map) ImpactedByPaths(changedPaths []string) Impact {
 	}
 }
 
+type inferredItem struct {
+	comp       Component
+	nodePkg    string
+	nodeDeps   []string
+}
+
 // inferManifests walks repoDir safely (read-only, max depth 4) and extracts
 // manifest-level components without executing any repository code.
 func inferManifests(repoDir string) ([]Component, []string, error) {
-	var comps []Component
+	var items []inferredItem
 	var gaps []string
-	pkgNames := make(map[string]string) // package name -> component ID for workspace dep wiring
-	rawPkgDeps := make(map[string][]string)
 
 	absRepo, err := filepath.Abs(repoDir)
 	if err != nil {
@@ -315,7 +329,6 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 			if rel != "." && (skipDirs[name] || (strings.HasPrefix(name, ".") && name != ".")) {
 				return filepath.SkipDir
 			}
-			// Keep scan bounded to depth 4.
 			if rel != "." && strings.Count(rel, "/") >= 4 {
 				return filepath.SkipDir
 			}
@@ -327,26 +340,17 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 
 		switch {
 		case base == "go.mod":
-			c := parseGoMod(p, absRepo, dirRel, rel)
-			comps = append(comps, c)
+			items = append(items, inferredItem{comp: parseGoMod(p, absRepo, dirRel, rel)})
 		case base == "package.json":
 			c, pkgName, deps := parsePackageJSON(p, dirRel, rel)
-			comps = append(comps, c)
-			if pkgName != "" {
-				pkgNames[pkgName] = c.ID
-			}
-			if len(deps) > 0 {
-				rawPkgDeps[c.ID] = deps
-			}
+			items = append(items, inferredItem{comp: c, nodePkg: pkgName, nodeDeps: deps})
 		case base == "Cargo.toml":
-			c := parseCargoToml(p, dirRel, rel)
-			comps = append(comps, c)
+			items = append(items, inferredItem{comp: parseCargoToml(p, dirRel, rel)})
 		case base == "pyproject.toml":
-			c := parsePyprojectToml(p, dirRel, rel)
-			comps = append(comps, c)
+			items = append(items, inferredItem{comp: parsePyprojectToml(p, dirRel, rel)})
 		case strings.HasSuffix(base, ".uproject"):
 			c, gap := parseUProject(p, dirRel, rel)
-			comps = append(comps, c)
+			items = append(items, inferredItem{comp: c})
 			if gap != "" {
 				gaps = append(gaps, gap)
 			}
@@ -357,26 +361,43 @@ func inferManifests(repoDir string) ([]Component, []string, error) {
 		return nil, nil, err
 	}
 
-	// Wire intra-repo package.json workspace/local dependencies.
-	for i := range comps {
-		if deps, ok := rawPkgDeps[comps[i].ID]; ok {
-			for _, depName := range deps {
-				if targetID, exists := pkgNames[depName]; exists && targetID != comps[i].ID {
-					comps[i].DependsOn = append(comps[i].DependsOn, targetID)
+	// Assign final deduplicated IDs BEFORE wiring intra-repo Node package dependencies
+	// so two manifests sharing a name (e.g. Cargo crate + package.json) never collide.
+	usedIDs := make(map[string]bool, len(items))
+	pkgNameToID := make(map[string]string)
+	for i := range items {
+		id := items[i].comp.ID
+		if usedIDs[id] {
+			cand := fmt.Sprintf("%s-%s", id, items[i].comp.Language)
+			if usedIDs[cand] {
+				for n := 2; ; n++ {
+					alt := fmt.Sprintf("%s-%d", cand, n)
+					if !usedIDs[alt] {
+						cand = alt
+						break
+					}
 				}
 			}
-			comps[i].DependsOn = uniqueSorted(comps[i].DependsOn)
+			id = cand
+			items[i].comp.ID = id
+		}
+		usedIDs[id] = true
+		if items[i].nodePkg != "" {
+			pkgNameToID[items[i].nodePkg] = id
 		}
 	}
 
-	// Deduplicate inferred IDs deterministically if two manifests sit in the same dir.
-	seen := make(map[string]int)
-	for i := range comps {
-		id := comps[i].ID
-		if n := seen[id]; n > 0 {
-			comps[i].ID = fmt.Sprintf("%s-%s", id, comps[i].Language)
+	comps := make([]Component, 0, len(items))
+	for i := range items {
+		if len(items[i].nodeDeps) > 0 {
+			for _, depName := range items[i].nodeDeps {
+				if targetID, exists := pkgNameToID[depName]; exists && targetID != items[i].comp.ID {
+					items[i].comp.DependsOn = append(items[i].comp.DependsOn, targetID)
+				}
+			}
+			items[i].comp.DependsOn = uniqueSorted(items[i].comp.DependsOn)
 		}
-		seen[id]++
+		comps = append(comps, items[i].comp)
 	}
 
 	return comps, gaps, nil
@@ -549,8 +570,8 @@ func extractTomlName(fullPath string) string {
 }
 
 // runProviderIfAuthorized executes an external read-only architecture provider ONLY
-// when explicitly authorized in config. Supports generic JSON `{components:[...], edges:[{from,to}]}`.
-func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, byID map[string]Component) ProviderStatus {
+// when explicitly authorized in config AND allowed by verified lock/policy options.
+func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, opts BuildOptions, byID map[string]Component) ProviderStatus {
 	ps := ProviderStatus{
 		ID:         p.ID,
 		Tool:       p.Tool,
@@ -559,6 +580,17 @@ func runProviderIfAuthorized(repoDir string, p config.ProviderConfig, byID map[s
 	if !p.Authorized {
 		ps.Note = "not authorized (set authorized: true and update .waypost.lock to run)"
 		return ps
+	}
+	if !opts.AllowProviders {
+		ps.Note = "blocked: lockfile or policy verification required before executing authorized providers"
+		return ps
+	}
+	if opts.AllowedProviderCommands != nil {
+		allowedCmd, ok := opts.AllowedProviderCommands[p.ID]
+		if !ok || allowedCmd != p.Command {
+			ps.Note = "blocked: provider not approved with this command in trusted base policy"
+			return ps
+		}
 	}
 	if p.Tool != "" {
 		if _, err := exec.LookPath(p.Tool); err != nil {

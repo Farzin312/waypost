@@ -20,15 +20,20 @@ const (
 	LocalConfigFileName = ".waypost.local.yaml"
 )
 
+// ReadRepoFileFunc reads a repository-relative path from a trusted source (e.g., git commit).
+type ReadRepoFileFunc func(relPath string) ([]byte, bool, error)
+
 // LoadOptions configures how .waypost.yaml and its inheritance chain are resolved.
 type LoadOptions struct {
-	// Mode is "local" (default) or "ci". In "ci" mode, .waypost.local.yaml is strictly ignored.
+	// Mode is "local" (default) or "ci". In "ci" mode, .waypost.local.yaml is never opened or applied.
 	Mode string
-	// OverrideRootRaw, when non-empty, parses this raw YAML instead of reading
-	// <repoDir>/.waypost.yaml (used for base-branch policy floor evaluation via git show).
+	// OverrideRootRaw, when non-empty, parses this raw YAML instead of reading <repoDir>/.waypost.yaml.
 	OverrideRootRaw []byte
 	// OverrideLabel is used in error messages when OverrideRootRaw is set.
 	OverrideLabel string
+	// RepoFileReader, when non-nil, reads file-based `extends` ancestors from that trusted reader
+	// (e.g. `git show <baseTip>:<relPath>`) instead of the live worktree.
+	RepoFileReader ReadRepoFileFunc
 }
 
 // ParseBytes unmarshals and validates a single config YAML document.
@@ -85,9 +90,9 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 
 	visited := map[string]bool{
 		"file:" + filepath.Clean(rootPath): true,
+		"repo:" + ConfigFileName:           true,
 	}
 
-	// Collect chain from child to root ancestor, then merge top-down (ancestor -> child).
 	type layer struct {
 		cfg  *Config
 		step *InheritanceStep
@@ -96,9 +101,12 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	layers = append(layers, layer{cfg: rootCfg})
 
 	currDir := absRepo
+	currRelDir := "."
 	nextRef := strings.TrimSpace(rootCfg.Extends)
+	var repoAncestorTrustPaths []string
+
 	for nextRef != "" {
-		parentCfg, step, parentDir, visitKey, err := resolveParent(nextRef, currDir)
+		parentCfg, step, parentDir, parentRelDir, visitKey, repoRelPath, err := resolveParent(nextRef, absRepo, currDir, currRelDir, mode, opts.RepoFileReader)
 		if err != nil {
 			return nil, err
 		}
@@ -106,8 +114,12 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 			return nil, fmt.Errorf("inheritance cycle detected at %q", nextRef)
 		}
 		visited[visitKey] = true
+		if repoRelPath != "" {
+			repoAncestorTrustPaths = append(repoAncestorTrustPaths, repoRelPath)
+		}
 		layers = append(layers, layer{cfg: parentCfg, step: step})
 		currDir = parentDir
+		currRelDir = parentRelDir
 		nextRef = strings.TrimSpace(parentCfg.Extends)
 	}
 
@@ -122,15 +134,23 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 		effective = mergeConfigs(effective, *layers[i].cfg)
 	}
 
-	// Handle .waypost.local.yaml strictly according to mode.
+	// Automatically treat any in-repo file-based `extends` ancestors as trust_paths.
+	if len(repoAncestorTrustPaths) > 0 {
+		effective.Policy.TrustPaths = mergeUniqueStrings(effective.Policy.TrustPaths, repoAncestorTrustPaths)
+	}
+
+	// Handle .waypost.local.yaml strictly according to mode:
+	// In CI mode, never open or read .waypost.local.yaml (only Lstat to report ignored=true).
 	localApplied := false
 	localIgnored := false
 	if len(opts.OverrideRootRaw) == 0 {
 		localPath := filepath.Join(absRepo, LocalConfigFileName)
-		if localRaw, err := os.ReadFile(localPath); err == nil {
-			if mode == "ci" {
+		if mode == "ci" {
+			if _, statErr := os.Lstat(localPath); statErr == nil {
 				localIgnored = true
-			} else {
+			}
+		} else {
+			if localRaw, err := os.ReadFile(localPath); err == nil {
 				localCfg, err := ParseBytes(localRaw, localPath)
 				if err != nil {
 					return nil, fmt.Errorf("invalid local override %s: %w", localPath, err)
@@ -140,13 +160,12 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 				}
 				effective = mergeConfigs(effective, *localCfg)
 				localApplied = true
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("read %s: %w", localPath, err)
 			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("read %s: %w", localPath, err)
 		}
 	}
 
-	// Apply defaults to policy fields if still nil.
 	if effective.Policy.FailClosedOnUnmapped == nil {
 		effective.Policy.FailClosedOnUnmapped = BoolPtr(true)
 	}
@@ -180,15 +199,15 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 	}, nil
 }
 
-func resolveParent(ref, baseDir string) (*Config, *InheritanceStep, string, string, error) {
+func resolveParent(ref, absRepo, baseDir, baseRelDir, mode string, repoReader ReadRepoFileFunc) (*Config, *InheritanceStep, string, string, string, string, error) {
 	if presets.IsBuiltin(ref) {
 		b, err := presets.Resolve(ref)
 		if err != nil {
-			return nil, nil, "", "", err
+			return nil, nil, "", "", "", "", err
 		}
 		cfg, err := ParseBytes(b.Raw, b.Ref)
 		if err != nil {
-			return nil, nil, "", "", err
+			return nil, nil, "", "", "", "", err
 		}
 		step := &InheritanceStep{
 			Ref:     b.Ref,
@@ -196,25 +215,85 @@ func resolveParent(ref, baseDir string) (*Config, *InheritanceStep, string, stri
 			Version: b.Version,
 			SHA256:  b.SHA256,
 		}
-		return cfg, step, baseDir, "builtin:" + b.Name, nil
+		return cfg, step, baseDir, baseRelDir, "builtin:" + b.Name, "", nil
 	}
 
-	// Local file preset path (relative to current config file directory or absolute).
+	// Never allow inheriting from .waypost.local.yaml in CI mode.
+	cleanRefBase := filepath.Base(filepath.Clean(ref))
+	if mode == "ci" && cleanRefBase == LocalConfigFileName {
+		return nil, nil, "", "", "", "", fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
+	}
+
+	// Trusted repo reader path (e.g. resolving base-branch policy floor strictly from git commit).
+	// Any in-repo ancestor MUST be read from git (never the PR worktree). External sibling presets
+	// strictly outside the repository root (e.g. an adjacent org-presets checkout) may be read from
+	// disk only after verifying their resolved path does not re-enter the PR repository via symlinks.
+	if repoReader != nil {
+		isExternal := filepath.IsAbs(ref)
+		joinedRel := ""
+		if !isExternal {
+			joinedRel = filepath.ToSlash(filepath.Clean(filepath.Join(baseRelDir, ref)))
+			if strings.HasPrefix(joinedRel, "../") || joinedRel == ".." {
+				isExternal = true
+			}
+		}
+		if !isExternal {
+			raw, exists, err := repoReader(joinedRel)
+			if err != nil {
+				return nil, nil, "", "", "", "", fmt.Errorf("read extends preset %q from trusted ref: %w", joinedRel, err)
+			}
+			if !exists {
+				return nil, nil, "", "", "", "", fmt.Errorf("extends preset %q not found in trusted git ref", joinedRel)
+			}
+			cfg, err := ParseBytes(raw, "git:"+joinedRel)
+			if err != nil {
+				return nil, nil, "", "", "", "", err
+			}
+			step := &InheritanceStep{
+				Ref:     ref,
+				Source:  "file",
+				Version: cfg.PresetVersion,
+				SHA256:  sha256Hex(raw),
+			}
+			return cfg, step, baseDir, filepath.ToSlash(filepath.Dir(joinedRel)), "repo:" + joinedRel, joinedRel, nil
+		}
+		// Verify external path truly resolves outside absRepo (no symlink back into PR checkout).
+		extPath := ref
+		if !filepath.IsAbs(extPath) {
+			extPath = filepath.Join(baseDir, extPath)
+		}
+		realExt, err := filepath.EvalSymlinks(extPath)
+		if err != nil {
+			return nil, nil, "", "", "", "", fmt.Errorf("resolve external extends preset %q: %w", ref, err)
+		}
+		realRepo, err := filepath.EvalSymlinks(absRepo)
+		if err == nil {
+			if rel, relErr := filepath.Rel(realRepo, realExt); relErr == nil && !strings.HasPrefix(rel, "..") {
+				return nil, nil, "", "", "", "", fmt.Errorf("external extends path %q symlinks back into PR repository", ref)
+			}
+		}
+	}
+
+	// Filesystem preset path.
 	p := ref
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(baseDir, p)
 	}
 	absPath, err := filepath.Abs(p)
 	if err != nil {
-		return nil, nil, "", "", fmt.Errorf("resolve extends path %q: %w", ref, err)
+		return nil, nil, "", "", "", "", fmt.Errorf("resolve extends path %q: %w", ref, err)
 	}
+	if mode == "ci" && filepath.Clean(absPath) == filepath.Clean(filepath.Join(absRepo, LocalConfigFileName)) {
+		return nil, nil, "", "", "", "", fmt.Errorf("extends may not reference %s in CI mode", LocalConfigFileName)
+	}
+
 	raw, err := os.ReadFile(absPath)
 	if err != nil {
-		return nil, nil, "", "", fmt.Errorf("read extends preset %q (%s): %w", ref, absPath, err)
+		return nil, nil, "", "", "", "", fmt.Errorf("read extends preset %q (%s): %w", ref, absPath, err)
 	}
 	cfg, err := ParseBytes(raw, absPath)
 	if err != nil {
-		return nil, nil, "", "", err
+		return nil, nil, "", "", "", "", err
 	}
 	step := &InheritanceStep{
 		Ref:     ref,
@@ -222,7 +301,16 @@ func resolveParent(ref, baseDir string) (*Config, *InheritanceStep, string, stri
 		Version: cfg.PresetVersion,
 		SHA256:  sha256Hex(raw),
 	}
-	return cfg, step, filepath.Dir(absPath), "file:" + filepath.Clean(absPath), nil
+
+	repoRelPath := ""
+	if rel, err := filepath.Rel(absRepo, absPath); err == nil {
+		rel = filepath.ToSlash(filepath.Clean(rel))
+		if !strings.HasPrefix(rel, "../") && rel != ".." {
+			repoRelPath = rel
+		}
+	}
+
+	return cfg, step, filepath.Dir(absPath), filepath.Dir(repoRelPath), "file:" + filepath.Clean(absPath), repoRelPath, nil
 }
 
 func validateSingle(cfg *Config, label string) error {
@@ -243,8 +331,18 @@ func validateSingle(cfg *Config, label string) error {
 	if err := checkDuplicateIDs(label, "component", len(cfg.Components), func(i int) string { return cfg.Components[i].ID }); err != nil {
 		return err
 	}
+	for _, c := range cfg.Components {
+		if strings.TrimSpace(c.Root) == "" {
+			return fmt.Errorf("%s: component %q requires a non-empty root", label, c.ID)
+		}
+	}
 	if err := checkDuplicateIDs(label, "pin", len(cfg.Pins), func(i int) string { return cfg.Pins[i].ID }); err != nil {
 		return err
+	}
+	for _, p := range cfg.Pins {
+		if strings.TrimSpace(p.Producer) == "" || strings.TrimSpace(p.Artifact) == "" || strings.TrimSpace(p.Consumer) == "" {
+			return fmt.Errorf("%s: pin %q requires non-empty producer, artifact, and consumer", label, p.ID)
+		}
 	}
 	if err := checkDuplicateIDs(label, "check", len(cfg.Checks), func(i int) string { return cfg.Checks[i].ID }); err != nil {
 		return err
@@ -258,6 +356,9 @@ func validateSingle(cfg *Config, label string) error {
 		return err
 	}
 	for _, s := range cfg.Skills {
+		if strings.TrimSpace(s.Source) == "" {
+			return fmt.Errorf("%s: skill %q requires a non-empty source", label, s.ID)
+		}
 		if s.Kind != "" && s.Kind != "invariant" && s.Kind != "crutch" {
 			return fmt.Errorf("%s: skill %q has invalid kind %q (must be \"invariant\" or \"crutch\")", label, s.ID, s.Kind)
 		}
@@ -265,15 +366,15 @@ func validateSingle(cfg *Config, label string) error {
 	if err := checkDuplicateIDs(label, "provider", len(cfg.Providers), func(i int) string { return cfg.Providers[i].ID }); err != nil {
 		return err
 	}
+	for _, p := range cfg.Providers {
+		if strings.TrimSpace(p.Tool) == "" || strings.TrimSpace(p.Command) == "" {
+			return fmt.Errorf("%s: provider %q requires non-empty tool and command", label, p.ID)
+		}
+	}
 	return nil
 }
 
 func validateEffective(cfg *Config) error {
-	compIDs := make(map[string]bool, len(cfg.Components))
-	for _, c := range cfg.Components {
-		compIDs[c.ID] = true
-	}
-	// Check that declared component depends_on doesn't self-reference.
 	for _, c := range cfg.Components {
 		for _, dep := range c.DependsOn {
 			if dep == c.ID {
@@ -331,7 +432,6 @@ func mergeConfigs(parent, child Config) Config {
 	}
 	out.Extends = child.Extends
 
-	// Policy merge
 	if child.Policy.FailClosedOnUnmapped != nil {
 		out.Policy.FailClosedOnUnmapped = child.Policy.FailClosedOnUnmapped
 	}

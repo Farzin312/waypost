@@ -55,9 +55,7 @@ type VerifyResult struct {
 	AuthorizationEscalation []string `json:"authorization_escalation,omitempty"`
 }
 
-// Generate constructs a Lockfile from a ResolvedConfig.
-// Note: callers generating a lockfile for commits should pass a ResolvedConfig
-// loaded in "ci" mode so .waypost.local.yaml never pollutes the committed lockfile.
+// Generate constructs a Lockfile from a canonical ResolvedConfig.
 func Generate(res *config.ResolvedConfig) Lockfile {
 	lf := Lockfile{
 		LockVersion:     "1",
@@ -97,19 +95,35 @@ func Marshal(lf Lockfile) ([]byte, error) {
 	return append([]byte(header), out...), nil
 }
 
-// Write writes <repoDir>/.waypost.lock atomically and returns its SHA-256 digest.
+// Write writes <repoDir>/.waypost.lock atomically using an exclusively created temp file
+// (never following pre-existing symlinks) and returns its SHA-256 digest.
 func Write(repoDir string, lf Lockfile) (string, error) {
 	b, err := Marshal(lf)
 	if err != nil {
 		return "", err
 	}
 	path := filepath.Join(repoDir, LockFileName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return "", fmt.Errorf("write lockfile tmp: %w", err)
+	f, err := os.CreateTemp(repoDir, ".waypost-lock-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create temp lockfile: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("write temp lockfile: %w", err)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("chmod temp lockfile: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("close temp lockfile: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("rename lockfile: %w", err)
 	}
 	return sha256Hex(b), nil
@@ -158,6 +172,9 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 	if lf.LockVersion != "1" {
 		res.Mismatches = append(res.Mismatches, fmt.Sprintf("unsupported lock_version %q", lf.LockVersion))
 	}
+	if lf.SchemaVersion != version.SchemaVersion {
+		res.Mismatches = append(res.Mismatches, fmt.Sprintf("schema_version mismatch: lock=%q current=%q", lf.SchemaVersion, version.SchemaVersion))
+	}
 	if lf.ResolverVersion != version.ResolverVersion {
 		res.Mismatches = append(res.Mismatches, fmt.Sprintf("resolver_version mismatch: lock=%q current=%q", lf.ResolverVersion, version.ResolverVersion))
 	}
@@ -168,7 +185,6 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 		res.Mismatches = append(res.Mismatches, fmt.Sprintf("effective policy digest mismatch: lock=%s current=%s", shortHash(lf.PolicyDigest), shortHash(canonicalRes.PolicyDigest)))
 	}
 
-	// Verify inheritance chain
 	if len(lf.Chain) != len(canonicalRes.Chain) {
 		res.Mismatches = append(res.Mismatches, fmt.Sprintf("inheritance chain length changed: lock=%d current=%d", len(lf.Chain), len(canonicalRes.Chain)))
 	} else {
@@ -180,15 +196,15 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 		}
 	}
 
-	// Detect authorization escalations on skills and providers.
 	lockedSkills := make(map[string]LockedSkill, len(lf.Skills))
 	for _, s := range lf.Skills {
 		lockedSkills[s.ID] = s
 	}
 	for _, s := range canonicalRes.Effective.Skills {
 		prev, ok := lockedSkills[s.ID]
-		if s.Authorized && (!ok || !prev.Authorized) {
-			res.AuthorizationEscalation = append(res.AuthorizationEscalation, fmt.Sprintf("skill %q newly authorized", s.ID))
+		if s.Authorized && (!ok || !prev.Authorized || prev.Source != s.Source || prev.Version != s.Version) {
+			res.AuthorizationEscalation = append(res.AuthorizationEscalation,
+				fmt.Sprintf("skill %q newly authorized or source/version changed (%s@%s)", s.ID, s.Source, s.Version))
 		}
 	}
 
@@ -198,8 +214,9 @@ func Verify(repoDir string, canonicalRes *config.ResolvedConfig) VerifyResult {
 	}
 	for _, p := range canonicalRes.Effective.Providers {
 		prev, ok := lockedProvs[p.ID]
-		if p.Authorized && (!ok || !prev.Authorized || prev.Command != p.Command) {
-			res.AuthorizationEscalation = append(res.AuthorizationEscalation, fmt.Sprintf("provider %q newly authorized or command changed", p.ID))
+		if p.Authorized && (!ok || !prev.Authorized || prev.Tool != p.Tool || prev.Command != p.Command) {
+			res.AuthorizationEscalation = append(res.AuthorizationEscalation,
+				fmt.Sprintf("provider %q newly authorized or tool/command changed (%s: %s)", p.ID, p.Tool, p.Command))
 		}
 	}
 

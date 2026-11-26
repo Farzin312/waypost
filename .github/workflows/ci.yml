@@ -39,13 +39,13 @@ jobs:
 
       - name: Dogfood waypost verify (CI authority + frozen lock)
         run: |
-          BASE_ARG=""
+          ARGS=(verify --mode ci --frozen --receipt .waypost/receipt.v1.json --markdown .waypost/receipt.md)
           if [ -n "${GITHUB_BASE_REF:-}" ]; then
-            BASE_ARG="--base origin/${GITHUB_BASE_REF}"
+            ARGS+=(--base "origin/${GITHUB_BASE_REF}")
+          else
+            ARGS+=(--all)
           fi
-          go run ./cmd/waypost verify --mode ci --frozen ${BASE_ARG} \
-            --receipt .waypost/receipt.v1.json \
-            --markdown .waypost/receipt.md
+          go run ./cmd/waypost "${ARGS[@]}"
           cat .waypost/receipt.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload verification receipt

@@ -59,6 +59,7 @@ type ReceiptGit struct {
 	HeadSHA        string `json:"head_sha,omitempty"`
 	TreeHash       string `json:"tree_hash,omitempty"`
 	BaseRef        string `json:"base_ref,omitempty"`
+	TargetSHA      string `json:"target_sha,omitempty"`
 	BaseSHA        string `json:"base_sha,omitempty"`
 	Dirty          bool   `json:"dirty"`
 	MergeBaseError string `json:"merge_base_error,omitempty"`
@@ -82,6 +83,7 @@ type ReceiptPolicy struct {
 	LockValid                bool     `json:"lock_valid"`
 	LockMismatches           []string `json:"lock_mismatches,omitempty"`
 	AuthorizationEscalations []string `json:"authorization_escalations,omitempty"`
+	PreflightFailures        []string `json:"preflight_failures,omitempty"`
 }
 
 type ReceiptImpact struct {
@@ -114,6 +116,11 @@ type ReceiptSummary struct {
 }
 
 // Run executes waypost verification end-to-end and returns a deterministic Receipt.
+// Security ordering:
+// 1. Inspect git snapshot and resolve trusted base policy floor from git (never PR worktree).
+// 2. Verify frozen lockfile and CI preflight guards BEFORE executing any providers or checks.
+// 3. Build component map (enabling providers ONLY if lock & base policy allow them).
+// 4. Plan and execute checks with strict 4-state outcomes and redacted excerpts.
 func Run(repoDir string, opts Options) (*Receipt, error) {
 	mode := opts.Mode
 	if mode == "" {
@@ -124,8 +131,6 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Canonical CI-mode resolution is used to validate .waypost.lock so local overrides
-	// never spuriously break lock verification in local mode.
 	canonicalRes := resolved
 	if mode != "ci" && resolved.LocalOverrideApplied {
 		canonicalRes, err = config.Load(repoDir, config.LoadOptions{Mode: "ci"})
@@ -134,24 +139,59 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 		}
 	}
 
-	lockReq := opts.Frozen || (mode == "ci" && config.BoolVal(resolved.Effective.Policy.RequireFrozenLockInCI, true))
-	lockRes := lockfile.Verify(repoDir, canonicalRes)
-
 	snap, err := gitdiff.Inspect(repoDir, opts.Base, mode)
 	if err != nil {
 		return nil, err
+	}
+
+	// Load trusted base policy floor FIRST so PR cannot disable CI controls.
+	baseFloor := policy.LoadBaseFloor(repoDir, mode, resolved, snap)
+	lockReq := opts.Frozen || (mode == "ci" && baseFloor.RequireFrozenLockInCI)
+	lockRes := lockfile.Verify(repoDir, canonicalRes)
+
+	// Evaluate fail-closed preflight conditions BEFORE running any external providers or checks.
+	var preflightFailures []string
+	if lockReq && !lockRes.Valid {
+		preflightFailures = append(preflightFailures, "frozen lockfile validation failed; aborting before executing commands")
+	}
+	if mode == "ci" {
+		if snap.MergeBaseError != "" {
+			preflightFailures = append(preflightFailures, "CI diff range invalid: "+snap.MergeBaseError)
+		}
+		if snap.IsGitRepo && snap.Dirty {
+			preflightFailures = append(preflightFailures, "CI worktree is dirty (uncommitted changes would mix live inputs with committed HEAD identity)")
+		}
+		if snap.IsGitRepo && snap.BaseSHA == "" && !opts.All {
+			preflightFailures = append(preflightFailures, "CI mode requires a valid git base ref (pass --base <ref>) or explicit --all")
+		}
+		if baseFloor.LoadError != "" {
+			preflightFailures = append(preflightFailures, baseFloor.LoadError)
+		}
+	}
+
+	// Only allow providers if preflight passed, lock is valid, and (in CI) base policy approved them.
+	allowProviders := len(preflightFailures) == 0 && lockRes.Valid
+	var allowedProvCmds map[string]string
+	if mode == "ci" && baseFloor.Loaded && baseFloor.Enforced {
+		allowedProvCmds = baseFloor.AllowedProviderCommands
+	} else if mode == "ci" {
+		// Without an established base policy floor, CI never executes newly introduced providers.
+		allowProviders = false
 	}
 
 	var tracked []string
 	if snap.IsGitRepo {
 		tracked, _ = gitdiff.ListTrackedFiles(repoDir)
 	}
-	cm, err := compmap.Build(repoDir, &resolved.Effective, tracked)
+	cm, err := compmap.BuildWithOptions(repoDir, &resolved.Effective, tracked, compmap.BuildOptions{
+		AllowProviders:          allowProviders,
+		AllowedProviderCommands: allowedProvCmds,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	plan, err := policy.Plan(repoDir, mode, resolved, cm, snap, opts.All)
+	plan, err := policy.Plan(repoDir, mode, resolved, baseFloor, cm, snap, opts.All)
 	if err != nil {
 		return nil, err
 	}
@@ -170,12 +210,13 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 			HeadSHA:        snap.HeadSHA,
 			TreeHash:       snap.TreeHash,
 			BaseRef:        snap.BaseRef,
+			TargetSHA:      snap.TargetSHA,
 			BaseSHA:        snap.BaseSHA,
 			Dirty:          snap.Dirty,
 			MergeBaseError: snap.MergeBaseError,
 		},
 		Digests: ReceiptDigests{
-			EffectivePolicyDigest: resolved.PolicyDigest,
+			EffectivePolicyDigest: plan.EffectivePolicyDigest,
 			ConfigSHA256:          resolved.RawRootSHA256,
 			LockDigest:            lockRes.LockDigest,
 		},
@@ -191,6 +232,7 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 			LockValid:                lockRes.Valid,
 			LockMismatches:           lockRes.Mismatches,
 			AuthorizationEscalations: lockRes.AuthorizationEscalation,
+			PreflightFailures:        preflightFailures,
 		},
 		Impact: ReceiptImpact{
 			ChangedPaths:         snap.AffectedPaths,
@@ -199,9 +241,28 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 			TriggeredPins:        plan.Impact.TriggeredPins,
 			UnmappedPaths:        plan.Impact.UnmappedPaths,
 		},
+		Checks: make([]CheckResult, 0, len(plan.Checks)),
 	}
 
-	// Execute checks.
+	// Refuse to execute any check commands if preflight failed (e.g. invalid frozen lock or dirty CI).
+	if len(preflightFailures) > 0 {
+		for _, sc := range plan.Checks {
+			cr := CheckResult{
+				ID:            sc.Check.ID,
+				Command:       sc.Check.Command,
+				Workdir:       sc.Check.Workdir,
+				Required:      sc.Check.IsRequired(),
+				FromBaseFloor: sc.FromBase,
+				Status:        StatusSkip,
+				Reason:        "aborted before execution due to preflight failure",
+			}
+			rec.Checks = append(rec.Checks, cr)
+			rec.Summary.Skipped++
+		}
+		rec.Summary.Outcome = StatusFail
+		return rec, nil
+	}
+
 	for _, sc := range plan.Checks {
 		cr := executeCheck(repoDir, sc)
 		rec.Checks = append(rec.Checks, cr)
@@ -217,17 +278,8 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 		}
 	}
 
-	// Determine final outcome (fail-closed on CI lock/merge-base failures).
-	failed := rec.Summary.Failed > 0
-	if lockReq && !lockRes.Valid {
-		failed = true
-	}
-	if mode == "ci" && snap.MergeBaseError != "" {
-		failed = true
-	}
-
 	switch {
-	case failed:
+	case rec.Summary.Failed > 0:
 		rec.Summary.Outcome = StatusFail
 	case rec.Summary.Warned > 0:
 		rec.Summary.Outcome = StatusWarn
@@ -332,7 +384,6 @@ func RedactAndTrim(raw string, maxBytes int) string {
 	}
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllStringFunc(s, func(match string) string {
-			// Preserve key prefix if present (= or : or Bearer ).
 			if idx := strings.IndexAny(match, "=:"); idx > 0 {
 				return match[:idx+1] + "[REDACTED]"
 			}
@@ -368,8 +419,8 @@ func RenderMarkdown(r *Receipt) string {
 	b.WriteString(fmt.Sprintf("- **Authority:** `%s` | **CLI:** `waypost %s` (schema `%s`, resolver `%s`)\n",
 		r.Authority, r.CLIVersion, r.SchemaVersion, r.ResolverVersion))
 	if r.Git.IsGitRepo {
-		b.WriteString(fmt.Sprintf("- **Git:** head `%s` | base `%s` | dirty `%v`\n",
-			short(r.Git.HeadSHA), short(r.Git.BaseSHA), r.Git.Dirty))
+		b.WriteString(fmt.Sprintf("- **Git:** head `%s` | base `%s` | target `%s` | dirty `%v`\n",
+			short(r.Git.HeadSHA), short(r.Git.BaseSHA), short(r.Git.TargetSHA), r.Git.Dirty))
 	}
 	b.WriteString(fmt.Sprintf("- **Digests:** policy `%s` | lock `%s` (valid: `%v`)\n",
 		short(r.Digests.EffectivePolicyDigest), short(r.Digests.LockDigest), r.Policy.LockValid))
@@ -380,6 +431,13 @@ func RenderMarkdown(r *Receipt) string {
 	b.WriteString(fmt.Sprintf("- **Totals:** %d PASS · %d FAIL · %d WARN · %d SKIP\n\n",
 		r.Summary.Passed, r.Summary.Failed, r.Summary.Warned, r.Summary.Skipped))
 
+	if len(r.Policy.PreflightFailures) > 0 {
+		b.WriteString("### Preflight Failures (Execution Aborted)\n")
+		for _, f := range r.Policy.PreflightFailures {
+			b.WriteString("- " + f + "\n")
+		}
+		b.WriteString("\n")
+	}
 	if len(r.Policy.TamperingFindings) > 0 {
 		b.WriteString("### Policy Floor Findings\n")
 		for _, f := range r.Policy.TamperingFindings {

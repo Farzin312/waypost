@@ -34,6 +34,7 @@
         "head_sha": { "type": "string" },
         "tree_hash": { "type": "string" },
         "base_ref": { "type": "string" },
+        "target_sha": { "type": "string" },
         "base_sha": { "type": "string" },
         "dirty": { "type": "boolean" },
         "merge_base_error": { "type": "string" }
@@ -70,7 +71,8 @@
         "lock_required": { "type": "boolean" },
         "lock_valid": { "type": "boolean" },
         "lock_mismatches": { "type": "array", "items": { "type": "string" } },
-        "authorization_escalations": { "type": "array", "items": { "type": "string" } }
+        "authorization_escalations": { "type": "array", "items": { "type": "string" } },
+        "preflight_failures": { "type": "array", "items": { "type": "string" } }
       }
     },
     "impact": {

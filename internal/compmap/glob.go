@@ -5,8 +5,8 @@ import (
 	"strings"
 )
 
-// MatchGlob matches a slash-normalized relative path against a gitignore/glob-style
-// pattern supporting `*`, `?`, and `**` across directory boundaries.
+// MatchGlob matches a slash-normalized relative path against a glob pattern
+// supporting `*`, `?`, and `**` across directory boundaries in O(len(pat)*len(tgt)) time.
 func MatchGlob(pattern, target string) bool {
 	pattern = strings.TrimPrefix(path.Clean(strings.ReplaceAll(pattern, "\\", "/")), "./")
 	target = strings.TrimPrefix(path.Clean(strings.ReplaceAll(target, "\\", "/")), "./")
@@ -18,39 +18,38 @@ func MatchGlob(pattern, target string) bool {
 	}
 	patSegs := strings.Split(pattern, "/")
 	tgtSegs := strings.Split(target, "/")
-	return matchSegments(patSegs, tgtSegs)
-}
 
-func matchSegments(pat, tgt []string) bool {
-	for len(pat) > 0 {
-		if pat[0] == "**" {
-			// Collapse consecutive ** segments.
-			for len(pat) > 1 && pat[1] == "**" {
-				pat = pat[1:]
+	// Iterative dynamic programming avoids exponential backtracking on repeated `**`.
+	m := len(patSegs)
+	n := len(tgtSegs)
+	dp := make([]bool, n+1)
+	dp[0] = true
+
+	for i := 1; i <= m; i++ {
+		next := make([]bool, n+1)
+		p := patSegs[i-1]
+		if p == "**" {
+			// `**` matches zero or more target segments.
+			matched := false
+			for j := 0; j <= n; j++ {
+				if dp[j] {
+					matched = true
+				}
+				next[j] = matched
 			}
-			// Trailing ** matches everything remaining (including zero segments).
-			if len(pat) == 1 {
-				return true
-			}
-			// Try matching zero or more target segments.
-			for i := 0; i <= len(tgt); i++ {
-				if matchSegments(pat[1:], tgt[i:]) {
-					return true
+		} else {
+			for j := 1; j <= n; j++ {
+				if !dp[j-1] {
+					continue
+				}
+				if ok, err := path.Match(p, tgtSegs[j-1]); err == nil && ok {
+					next[j] = true
 				}
 			}
-			return false
 		}
-		if len(tgt) == 0 {
-			return false
-		}
-		ok, err := path.Match(pat[0], tgt[0])
-		if err != nil || !ok {
-			return false
-		}
-		pat = pat[1:]
-		tgt = tgt[1:]
+		dp = next
 	}
-	return len(tgt) == 0
+	return dp[n]
 }
 
 // MatchAnyGlob returns true if target matches any pattern in patterns.

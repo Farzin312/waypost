@@ -1,7 +1,6 @@
-# Local developer overrides (never read in CI mode)
+# Local developer overrides and generated artifacts (never read in CI mode)
 .waypost.local.yaml
-.waypost/cache/
-.waypost/receipts/
+.waypost/
 
 # Build artifacts
 /waypost

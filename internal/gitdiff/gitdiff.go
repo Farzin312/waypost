@@ -18,23 +18,23 @@ type Change struct {
 }
 
 // Snapshot captures repository git identity and changed paths relative to a base ref.
+// TargetSHA is the resolved tip commit of BaseRef (used for base-branch policy authority),
+// while BaseSHA is the merge-base commit (used as the diff starting point).
 type Snapshot struct {
-	IsGitRepo        bool     `json:"is_git_repo"`
-	HeadSHA          string   `json:"head_sha"`
-	TreeHash         string   `json:"tree_hash"`
-	BaseRef          string   `json:"base_ref,omitempty"`
-	BaseSHA          string   `json:"base_sha,omitempty"`
-	Dirty            bool     `json:"dirty"`
-	Changes          []Change `json:"changes,omitempty"`
-	AffectedPaths    []string `json:"affected_paths,omitempty"` // Sorted unique union of Path and OldPath
-	MergeBaseError   string   `json:"merge_base_error,omitempty"`
+	IsGitRepo      bool     `json:"is_git_repo"`
+	HeadSHA        string   `json:"head_sha"`
+	TreeHash       string   `json:"tree_hash"`
+	BaseRef        string   `json:"base_ref,omitempty"`
+	TargetSHA      string   `json:"target_sha,omitempty"`
+	BaseSHA        string   `json:"base_sha,omitempty"`
+	Dirty          bool     `json:"dirty"`
+	Changes        []Change `json:"changes,omitempty"`
+	AffectedPaths  []string `json:"affected_paths,omitempty"` // Sorted unique union of Path and OldPath
+	MergeBaseError string   `json:"merge_base_error,omitempty"`
 }
 
 // Inspect computes git identity, dirty state, and changed paths against baseRef.
-// When mode == "ci", diff is evaluated strictly on committed range <merge-base>..HEAD
-// (plus dirty files are still reported so receipts bind honestly to working state).
-// When mode == "local", diff includes both committed and uncommitted changes vs baseRef
-// (or vs HEAD if baseRef is empty).
+// Uses NUL-delimited (`-z`) git output so non-ASCII and special filenames are never C-quoted.
 func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 	snap := &Snapshot{BaseRef: baseRef}
 	if _, err := runGit(repoDir, "rev-parse", "--is-inside-work-tree"); err != nil {
@@ -51,36 +51,34 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 		snap.TreeHash = strings.TrimSpace(tree)
 	}
 
-	statusOut, err := runGit(repoDir, "status", "--porcelain")
+	statusOut, err := runGit(repoDir, "status", "--porcelain", "-z")
 	if err == nil {
-		trimmed := strings.TrimSpace(statusOut)
-		snap.Dirty = trimmed != ""
+		snap.Dirty = len(statusOut) > 0
 	}
 
-	// Determine effective base SHA.
+	// Resolve target commit and strict merge-base.
 	var diffBase string
 	if baseRef != "" {
-		mb, err := runGit(repoDir, "merge-base", baseRef, "HEAD")
-		if err != nil {
-			// Fallback: check if baseRef itself resolves as a commit (e.g., direct parent SHA).
-			if rev, revErr := runGit(repoDir, "rev-parse", "--verify", baseRef+"^{commit}"); revErr == nil {
-				diffBase = strings.TrimSpace(rev)
-				snap.BaseSHA = diffBase
-			} else {
-				snap.MergeBaseError = fmt.Sprintf("unable to resolve merge-base for %q: %v", baseRef, err)
-				return snap, nil
-			}
-		} else {
-			diffBase = strings.TrimSpace(mb)
-			snap.BaseSHA = diffBase
+		target, targetErr := runGit(repoDir, "rev-parse", "--verify", baseRef+"^{commit}")
+		if targetErr != nil {
+			snap.MergeBaseError = fmt.Sprintf("unable to resolve base ref %q: %v", baseRef, targetErr)
+			return snap, nil
 		}
+		snap.TargetSHA = strings.TrimSpace(target)
+		mb, err := runGit(repoDir, "merge-base", snap.TargetSHA, "HEAD")
+		if err != nil {
+			snap.MergeBaseError = fmt.Sprintf("unable to compute merge-base between %q and HEAD: %v", baseRef, err)
+			return snap, nil
+		}
+		diffBase = strings.TrimSpace(mb)
+		snap.BaseSHA = diffBase
 	} else {
-		// Auto-detect origin/main, main, master, or HEAD~1 if available.
 		for _, candidate := range []string{"origin/main", "main", "master"} {
 			if rev, err := runGit(repoDir, "rev-parse", "--verify", candidate+"^{commit}"); err == nil {
-				mb, mbErr := runGit(repoDir, "merge-base", strings.TrimSpace(rev), "HEAD")
-				if mbErr == nil {
+				targetSHA := strings.TrimSpace(rev)
+				if mb, mbErr := runGit(repoDir, "merge-base", targetSHA, "HEAD"); mbErr == nil {
 					snap.BaseRef = candidate
+					snap.TargetSHA = targetSHA
 					diffBase = strings.TrimSpace(mb)
 					snap.BaseSHA = diffBase
 					break
@@ -101,41 +99,40 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 	}
 
 	if diffBase != "" {
-		args := []string{"diff", "-M", "--name-status"}
+		args := []string{"-c", "core.quotepath=false", "diff", "-M", "--name-status", "-z"}
 		if mode == "ci" {
 			args = append(args, diffBase, "HEAD")
 		} else {
-			// Includes committed, staged, and unstaged working tree edits vs merge-base.
 			args = append(args, diffBase)
 		}
-		out, err := runGit(repoDir, args...)
+		out, err := runGitBytes(repoDir, args...)
 		if err != nil {
 			return snap, fmt.Errorf("git diff: %w", err)
 		}
-		for _, ch := range ParseNameStatus(out) {
+		for _, ch := range ParseNameStatusZ(out) {
 			addChange(ch)
 		}
 	} else if snap.HeadSHA != "" {
-		// Single-branch/no-base local inspection: diff working tree vs HEAD.
-		out, err := runGit(repoDir, "diff", "-M", "--name-status", "HEAD")
+		out, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "diff", "-M", "--name-status", "-z", "HEAD")
 		if err == nil {
-			for _, ch := range ParseNameStatus(out) {
+			for _, ch := range ParseNameStatusZ(out) {
 				addChange(ch)
 			}
 		}
 	}
 
-	// Include untracked files in local mode (not ignored) so newly added files are mapped.
+	// Include untracked files in local mode (NUL-delimited).
 	if mode != "ci" {
-		untracked, err := runGit(repoDir, "ls-files", "--others", "--exclude-standard")
+		untracked, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z")
 		if err == nil {
-			for _, line := range strings.Split(strings.TrimSpace(untracked), "\n") {
-				p := strings.TrimSpace(line)
+			for _, rawPath := range bytes.Split(untracked, []byte{0}) {
+				p := string(rawPath)
 				if p == "" {
 					continue
 				}
-				if !pathSet[filepath.ToSlash(p)] {
-					addChange(Change{Status: "A", Path: filepath.ToSlash(p)})
+				norm := filepath.ToSlash(p)
+				if !pathSet[norm] {
+					addChange(Change{Status: "A", Path: norm})
 				}
 			}
 		}
@@ -149,8 +146,46 @@ func Inspect(repoDir, baseRef, mode string) (*Snapshot, error) {
 	return snap, nil
 }
 
-// ParseNameStatus parses `git diff -M --name-status` output, preserving BOTH sides
-// of renames (R) and copies (C) as well as deletions (D).
+// ParseNameStatusZ parses NUL-delimited `git diff -M --name-status -z` output,
+// preserving literal non-ASCII/special path bytes and BOTH sides of renames/copies.
+func ParseNameStatusZ(out []byte) []Change {
+	var changes []Change
+	tokens := bytes.Split(out, []byte{0})
+	for i := 0; i < len(tokens); {
+		status := string(tokens[i])
+		if status == "" {
+			i++
+			continue
+		}
+		code := string(status[0])
+		switch code {
+		case "R", "C":
+			if i+2 < len(tokens) {
+				changes = append(changes, Change{
+					Status:  code,
+					OldPath: filepath.ToSlash(string(tokens[i+1])),
+					Path:    filepath.ToSlash(string(tokens[i+2])),
+				})
+				i += 3
+			} else {
+				i = len(tokens)
+			}
+		default:
+			if i+1 < len(tokens) {
+				changes = append(changes, Change{
+					Status: code,
+					Path:   filepath.ToSlash(string(tokens[i+1])),
+				})
+				i += 2
+			} else {
+				i = len(tokens)
+			}
+		}
+	}
+	return changes
+}
+
+// ParseNameStatus parses line-delimited `git diff -M --name-status` output.
 func ParseNameStatus(out string) []Change {
 	var changes []Change
 	for _, rawLine := range strings.Split(out, "\n") {
@@ -159,14 +194,10 @@ func ParseNameStatus(out string) []Change {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) < 2 {
+		if len(fields) < 2 || len(fields[0]) == 0 {
 			continue
 		}
-		status := strings.TrimSpace(fields[0])
-		if len(status) == 0 {
-			continue
-		}
-		code := string(status[0])
+		code := string(fields[0][0])
 		switch code {
 		case "R", "C":
 			if len(fields) >= 3 {
@@ -192,7 +223,11 @@ func ReadFileAtRef(repoDir, ref, relPath string) ([]byte, bool, error) {
 	if ref == "" {
 		return nil, false, nil
 	}
-	spec := ref + ":" + filepath.ToSlash(relPath)
+	cleanRel := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relPath)), "./")
+	if strings.HasPrefix(cleanRel, "../") || cleanRel == ".." || filepath.IsAbs(relPath) {
+		return nil, false, fmt.Errorf("path %q escapes repository root at ref %s", relPath, ref)
+	}
+	spec := ref + ":" + cleanRel
 	cmd := exec.Command("git", "-C", repoDir, "show", spec)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -207,15 +242,15 @@ func ReadFileAtRef(repoDir, ref, relPath string) ([]byte, bool, error) {
 	return stdout.Bytes(), true, nil
 }
 
-// ListTrackedFiles lists all tracked files in the git repo (used for coverage/unmapped-path audits).
+// ListTrackedFiles lists all tracked files in the git repo using NUL-delimited output.
 func ListTrackedFiles(repoDir string) ([]string, error) {
-	out, err := runGit(repoDir, "ls-files")
+	out, err := runGitBytes(repoDir, "-c", "core.quotepath=false", "ls-files", "-z")
 	if err != nil {
 		return nil, err
 	}
 	var files []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		p := strings.TrimSpace(line)
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		p := string(raw)
 		if p != "" {
 			files = append(files, filepath.ToSlash(p))
 		}
@@ -225,6 +260,14 @@ func ListTrackedFiles(repoDir string) ([]string, error) {
 }
 
 func runGit(repoDir string, args ...string) (string, error) {
+	b, err := runGitBytes(repoDir, args...)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func runGitBytes(repoDir string, args ...string) ([]byte, error) {
 	fullArgs := append([]string{"-C", repoDir}, args...)
 	cmd := exec.Command("git", fullArgs...)
 	var stdout, stderr bytes.Buffer
@@ -235,7 +278,7 @@ func runGit(repoDir string, args ...string) (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", errors.New(msg)
+		return nil, errors.New(msg)
 	}
-	return stdout.String(), nil
+	return stdout.Bytes(), nil
 }

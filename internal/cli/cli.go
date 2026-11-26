@@ -353,7 +353,9 @@ func runContext(args []string, stdout io.Writer) error {
 	}
 
 	tracked, _ := gitdiff.ListTrackedFiles(absDir)
-	cm, err := compmap.Build(absDir, cfgPtr, tracked)
+	cm, err := compmap.BuildWithOptions(absDir, cfgPtr, tracked, compmap.BuildOptions{
+		AllowProviders: out.Lock != nil && out.Lock.Valid,
+	})
 	if err != nil {
 		return err
 	}
