@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Farzin312/waypost/blob/main/schemas/receipt.v1.schema.json",
+  "title": "Waypost Verification Receipt v1 (receipt.v1.json)",
+  "type": "object",
+  "required": [
+    "receipt_version",
+    "schema_version",
+    "resolver_version",
+    "cli_version",
+    "platform",
+    "generated_at",
+    "authority",
+    "git",
+    "digests",
+    "policy",
+    "impact",
+    "checks",
+    "summary"
+  ],
+  "properties": {
+    "receipt_version": { "type": "string", "const": "1" },
+    "schema_version": { "type": "string" },
+    "resolver_version": { "type": "string" },
+    "cli_version": { "type": "string" },
+    "platform": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "authority": { "type": "string", "enum": ["local", "ci"] },
+    "git": {
+      "type": "object",
+      "required": ["is_git_repo", "dirty"],
+      "properties": {
+        "is_git_repo": { "type": "boolean" },
+        "head_sha": { "type": "string" },
+        "tree_hash": { "type": "string" },
+        "base_ref": { "type": "string" },
+        "base_sha": { "type": "string" },
+        "dirty": { "type": "boolean" },
+        "merge_base_error": { "type": "string" }
+      }
+    },
+    "digests": {
+      "type": "object",
+      "required": ["effective_policy_digest", "config_sha256"],
+      "properties": {
+        "effective_policy_digest": { "type": "string" },
+        "config_sha256": { "type": "string" },
+        "lock_digest": { "type": "string" }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "trust_boundary_triggered",
+        "policy_floor_enforced",
+        "full_repo_escalated",
+        "local_override_applied",
+        "local_override_ignored",
+        "lock_required",
+        "lock_valid"
+      ],
+      "properties": {
+        "trust_boundary_triggered": { "type": "boolean" },
+        "policy_floor_enforced": { "type": "boolean" },
+        "full_repo_escalated": { "type": "boolean" },
+        "local_override_applied": { "type": "boolean" },
+        "local_override_ignored": { "type": "boolean" },
+        "escalation_reasons": { "type": "array", "items": { "type": "string" } },
+        "tampering_findings": { "type": "array", "items": { "type": "string" } },
+        "lock_required": { "type": "boolean" },
+        "lock_valid": { "type": "boolean" },
+        "lock_mismatches": { "type": "array", "items": { "type": "string" } },
+        "authorization_escalations": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "impact": {
+      "type": "object",
+      "properties": {
+        "changed_paths": { "type": "array", "items": { "type": "string" } },
+        "direct_components": { "type": "array", "items": { "type": "string" } },
+        "transitive_dependents": { "type": "array", "items": { "type": "string" } },
+        "triggered_pins": { "type": "array", "items": { "type": "string" } },
+        "unmapped_paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "command", "required", "status", "exit_code", "duration_ms"],
+        "properties": {
+          "id": { "type": "string" },
+          "command": { "type": "string" },
+          "workdir": { "type": "string" },
+          "required": { "type": "boolean" },
+          "from_base_floor": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "WARN", "SKIP"] },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "reason": { "type": "string" },
+          "output_excerpt": { "type": "string" }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["outcome", "passed", "failed", "warned", "skipped"],
+      "properties": {
+        "outcome": { "type": "string", "enum": ["PASS", "FAIL", "WARN"] },
+        "passed": { "type": "integer" },
+        "failed": { "type": "integer" },
+        "warned": { "type": "integer" },
+        "skipped": { "type": "integer" }
+      }
+    }
+  }
+}

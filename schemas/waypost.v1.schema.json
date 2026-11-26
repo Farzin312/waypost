@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Farzin312/waypost/blob/main/schemas/waypost.v1.schema.json",
+  "title": "Waypost Configuration v1 (.waypost.yaml)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1" },
+    "name": { "type": "string" },
+    "preset_version": { "type": "string" },
+    "description": { "type": "string" },
+    "extends": {
+      "type": "string",
+      "description": "Single-parent preset reference (builtin:<name>@<version> or relative/absolute file path)."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fail_closed_on_unmapped": { "type": "boolean", "default": true },
+        "require_frozen_lock_in_ci": { "type": "boolean", "default": true },
+        "enforce_base_floor_in_ci": { "type": "boolean", "default": true },
+        "trust_paths": { "type": "array", "items": { "type": "string" } },
+        "max_context_items": { "type": "integer", "minimum": 1, "default": 50 }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "summary"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "enum": ["invariant", "crutch"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "review_after": { "type": "string" }
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "root"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "root": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string" },
+          "language": { "type": "string" },
+          "description": { "type": "string" },
+          "depends_on": { "type": "array", "items": { "type": "string" } },
+          "entrypoints": { "type": "array", "items": { "type": "string" } },
+          "trust_paths": { "type": "array", "items": { "type": "string" } },
+          "checks": { "type": "array", "items": { "type": "string" } },
+          "paths": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "pins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "producer", "artifact", "consumer"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "producer": { "type": "string", "minLength": 1 },
+          "artifact": { "type": "string", "minLength": 1 },
+          "consumer": { "type": "string", "minLength": 1 },
+          "version": { "type": "string" },
+          "compatibility_check": { "type": "string" },
+          "paths": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "command"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1 },
+          "workdir": { "type": "string" },
+          "paths": { "type": "array", "items": { "type": "string" } },
+          "components": { "type": "array", "items": { "type": "string" } },
+          "required": { "type": "boolean", "default": true },
+          "timeout_seconds": { "type": "integer", "minimum": 1 },
+          "description": { "type": "string" },
+          "requires_bin": { "type": "string" }
+        }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "source": { "type": "string", "minLength": 1 },
+          "version": { "type": "string" },
+          "kind": { "type": "string", "enum": ["invariant", "crutch"] },
+          "authorized": { "type": "boolean", "default": false },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "tool", "command"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "tool": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1 },
+          "authorized": { "type": "boolean", "default": false },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "coverage_gaps": { "type": "array", "items": { "type": "string" } },
+    "disable_checks": { "type": "array", "items": { "type": "string" } },
+    "disable_rules": { "type": "array", "items": { "type": "string" } }
+  }
+}

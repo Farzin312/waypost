@@ -1,0 +1,35 @@
+schema_version: "1"
+name: example-unreal-game
+extends: "builtin:polyglot-native@1.0.0"
+description: "Worked example of a polyglot Unreal C++ + Python validator repository with honest coverage gaps."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - "game/*.uproject"
+    - "game/Source/**/*.Build.cs"
+components:
+  - id: content-data
+    root: data
+    kind: schemas
+    language: json
+    paths: ["data/**"]
+    checks: ["python-validators"]
+  - id: tooling
+    root: tools
+    kind: validators
+    language: python
+    depends_on: ["content-data"]
+    paths: ["tools/**"]
+    checks: ["python-validators"]
+  - id: game-runtime
+    root: game
+    kind: unreal-project
+    language: cpp
+    depends_on: ["content-data"]
+    entrypoints: ["game/Source/Game"]
+    paths: ["game/**"]
+coverage_gaps:
+  - "Binary audio/mesh assets under art/** are intentionally unmapped; edits escalate to full validator checks and require human review."
+  - "Unreal C++ compilation and shader validation require an Unreal Engine host runner."

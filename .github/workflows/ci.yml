@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-dogfood:
+    name: Test, Cross-Compile & Dogfood
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for base policy floor)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test (-race)
+        run: go test -race -v ./...
+
+      - name: Cross-compile pure Go (CGO_ENABLED=0)
+        run: |
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o dist/waypost-darwin-arm64  ./cmd/waypost
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/waypost-linux-amd64   ./cmd/waypost
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o dist/waypost-linux-arm64   ./cmd/waypost
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/waypost-windows-amd64.exe ./cmd/waypost
+          ls -lh dist/
+
+      - name: Dogfood waypost verify (CI authority + frozen lock)
+        run: |
+          BASE_ARG=""
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            BASE_ARG="--base origin/${GITHUB_BASE_REF}"
+          fi
+          go run ./cmd/waypost verify --mode ci --frozen ${BASE_ARG} \
+            --receipt .waypost/receipt.v1.json \
+            --markdown .waypost/receipt.md
+          cat .waypost/receipt.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verification receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: waypost-receipt
+          path: .waypost/receipt.v1.json
+          if-no-files-found: ignore

@@ -1,0 +1,138 @@
+package config
+
+// Config is the declarative v1 repository contract (.waypost.yaml).
+type Config struct {
+	SchemaVersion string            `yaml:"schema_version" json:"schema_version"`
+	Name          string            `yaml:"name,omitempty" json:"name,omitempty"`
+	PresetVersion string            `yaml:"preset_version,omitempty" json:"preset_version,omitempty"`
+	Description   string            `yaml:"description,omitempty" json:"description,omitempty"`
+	Extends       string            `yaml:"extends,omitempty" json:"extends,omitempty"`
+	Policy        PolicyConfig      `yaml:"policy,omitempty" json:"policy"`
+	Rules         []Rule            `yaml:"rules,omitempty" json:"rules,omitempty"`
+	Components    []ComponentConfig `yaml:"components,omitempty" json:"components,omitempty"`
+	Pins          []CrossRepoPin    `yaml:"pins,omitempty" json:"pins,omitempty"`
+	Checks        []Check           `yaml:"checks,omitempty" json:"checks,omitempty"`
+	Skills        []SkillRef        `yaml:"skills,omitempty" json:"skills,omitempty"`
+	Providers     []ProviderConfig  `yaml:"providers,omitempty" json:"providers,omitempty"`
+	CoverageGaps  []string          `yaml:"coverage_gaps,omitempty" json:"coverage_gaps,omitempty"`
+	// Explicit opt-out lists for disabling inherited entries by stable ID.
+	// In CI mode, disabling a base-branch required check is caught by the base policy floor.
+	DisableChecks []string `yaml:"disable_checks,omitempty" json:"disable_checks,omitempty"`
+	DisableRules  []string `yaml:"disable_rules,omitempty" json:"disable_rules,omitempty"`
+}
+
+// PolicyConfig controls fail-closed verification and trust-boundary escalation.
+type PolicyConfig struct {
+	FailClosedOnUnmapped  *bool    `yaml:"fail_closed_on_unmapped,omitempty" json:"fail_closed_on_unmapped,omitempty"`
+	RequireFrozenLockInCI *bool    `yaml:"require_frozen_lock_in_ci,omitempty" json:"require_frozen_lock_in_ci,omitempty"`
+	EnforceBaseFloorInCI  *bool    `yaml:"enforce_base_floor_in_ci,omitempty" json:"enforce_base_floor_in_ci,omitempty"`
+	TrustPaths            []string `yaml:"trust_paths,omitempty" json:"trust_paths,omitempty"`
+	MaxContextItems       int      `yaml:"max_context_items,omitempty" json:"max_context_items,omitempty"`
+}
+
+// BoolVal returns the bool value or the fallback default when unset.
+func BoolVal(b *bool, def bool) bool {
+	if b == nil {
+		return def
+	}
+	return *b
+}
+
+// BoolPtr returns a pointer to v.
+func BoolPtr(v bool) *bool { return &v }
+
+// Rule is a repository or preset engineering norm classified as either a
+// permanent invariant or a model-era crutch subject to periodic pruning.
+type Rule struct {
+	ID          string `yaml:"id" json:"id"`
+	Kind        string `yaml:"kind" json:"kind"` // "invariant" | "crutch"
+	Summary     string `yaml:"summary" json:"summary"`
+	ReviewAfter string `yaml:"review_after,omitempty" json:"review_after,omitempty"`
+}
+
+// ComponentConfig declares a repository component, its dependencies, entrypoints,
+// trust paths, and bound checks.
+type ComponentConfig struct {
+	ID          string   `yaml:"id" json:"id"`
+	Root        string   `yaml:"root" json:"root"`
+	Kind        string   `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Language    string   `yaml:"language,omitempty" json:"language,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	DependsOn   []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+	Entrypoints []string `yaml:"entrypoints,omitempty" json:"entrypoints,omitempty"`
+	TrustPaths  []string `yaml:"trust_paths,omitempty" json:"trust_paths,omitempty"`
+	Checks      []string `yaml:"checks,omitempty" json:"checks,omitempty"`
+	Paths       []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+}
+
+// CrossRepoPin documents an explicit dependency on an external repository contract.
+type CrossRepoPin struct {
+	ID                 string   `yaml:"id" json:"id"`
+	Producer           string   `yaml:"producer" json:"producer"`
+	Artifact           string   `yaml:"artifact" json:"artifact"`
+	Consumer           string   `yaml:"consumer" json:"consumer"`
+	Version            string   `yaml:"version,omitempty" json:"version,omitempty"`
+	CompatibilityCheck string   `yaml:"compatibility_check,omitempty" json:"compatibility_check,omitempty"`
+	Paths              []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+}
+
+// Check defines a deterministic verification command bound to file globs or components.
+type Check struct {
+	ID             string   `yaml:"id" json:"id"`
+	Command        string   `yaml:"command" json:"command"`
+	Workdir        string   `yaml:"workdir,omitempty" json:"workdir,omitempty"`
+	Paths          []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+	Components     []string `yaml:"components,omitempty" json:"components,omitempty"`
+	Required       *bool    `yaml:"required,omitempty" json:"required,omitempty"`
+	TimeoutSeconds int      `yaml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Description    string   `yaml:"description,omitempty" json:"description,omitempty"`
+	// RequiresBin optionally specifies an executable name that must exist in PATH.
+	// If missing on a required check, verify fails closed (FAIL, never PASS/SKIP).
+	RequiresBin string `yaml:"requires_bin,omitempty" json:"requires_bin,omitempty"`
+}
+
+// IsRequired reports whether the check is required (defaults to true).
+func (c Check) IsRequired() bool {
+	return BoolVal(c.Required, true)
+}
+
+// SkillRef declares an external or standard agent skill/tool reference.
+// Fetching/locking a skill never auto-authorizes script execution; `authorized: true`
+// must be explicitly set and reviewed.
+type SkillRef struct {
+	ID          string `yaml:"id" json:"id"`
+	Source      string `yaml:"source" json:"source"`
+	Version     string `yaml:"version,omitempty" json:"version,omitempty"`
+	Kind        string `yaml:"kind,omitempty" json:"kind,omitempty"` // "invariant" | "crutch"
+	Authorized  bool   `yaml:"authorized,omitempty" json:"authorized,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+}
+
+// ProviderConfig configures an external read-only architecture/graph provider
+// (for example, `bounds report --json`). Execution requires `authorized: true`.
+type ProviderConfig struct {
+	ID          string `yaml:"id" json:"id"`
+	Tool        string `yaml:"tool" json:"tool"`
+	Command     string `yaml:"command" json:"command"`
+	Authorized  bool   `yaml:"authorized,omitempty" json:"authorized,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+}
+
+// InheritanceStep records one resolved ancestor in the single-parent chain.
+type InheritanceStep struct {
+	Ref     string `json:"ref"`
+	Source  string `json:"source"` // "builtin" | "file"
+	Version string `json:"version,omitempty"`
+	SHA256  string `json:"sha256"`
+}
+
+// ResolvedConfig holds the merged effective configuration alongside its provenance.
+type ResolvedConfig struct {
+	Effective            Config            `json:"effective"`
+	RootPath             string            `json:"root_path"`
+	Chain                []InheritanceStep `json:"chain"`
+	PolicyDigest         string            `json:"policy_digest"`
+	LocalOverrideApplied bool              `json:"local_override_applied"`
+	LocalOverrideIgnored bool              `json:"local_override_ignored"`
+	RawRootSHA256        string            `json:"raw_root_sha256"`
+}

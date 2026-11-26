@@ -1,0 +1,31 @@
+schema_version: "1"
+name: builtin-base
+preset_version: "1.0.0"
+description: "Minimal language-agnostic agent-first delivery baseline."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - ".waypost.yaml"
+    - ".waypost.lock"
+    - ".github/workflows/**"
+    - "AGENTS.md"
+  max_context_items: 50
+rules:
+  - id: verify-before-claim
+    kind: invariant
+    summary: "Never claim a task is complete without a fresh verification receipt matching the current tree."
+  - id: honest-statuses
+    kind: invariant
+    summary: "Report PASS, FAIL, WARN, and SKIP distinctly; skipped or unavailable required checks never pass."
+  - id: trust-boundary-escalation
+    kind: invariant
+    summary: "Edits to policy, lockfiles, workflows, or trust paths escalate to full repository verification."
+  - id: bounded-context-first
+    kind: crutch
+    summary: "Run `waypost context --changed` before broad repository greps to orient on component boundaries and reverse dependents."
+    review_after: "2027-06-01"
+checks: []
+skills: []
+providers: []

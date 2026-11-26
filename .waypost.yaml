@@ -1,0 +1,131 @@
+# Waypost v1 repository contract — dogfooding waypost on itself.
+schema_version: "1"
+name: waypost
+extends: "builtin:base@1.0.0"
+description: "Agent-first repository orientation, inheritable policy, and deterministic verification CLI."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - ".waypost.yaml"
+    - ".waypost.lock"
+    - ".github/workflows/**"
+    - "action/action.yml"
+    - "schemas/**"
+    - "AGENTS.md"
+    - "go.mod"
+    - "go.sum"
+components:
+  - id: cli-entrypoint
+    root: cmd/waypost
+    kind: binary
+    language: go
+    depends_on: ["cli", "version"]
+    entrypoints: ["cmd/waypost/main.go"]
+    paths: ["cmd/waypost/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: cli
+    root: internal/cli
+    kind: package
+    language: go
+    depends_on: ["compmap", "config", "gitdiff", "lockfile", "presets", "upgrade", "verify", "version"]
+    paths: ["internal/cli/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: config
+    root: internal/config
+    kind: package
+    language: go
+    depends_on: ["presets", "version"]
+    paths: ["internal/config/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: presets
+    root: internal/presets
+    kind: package
+    language: go
+    paths: ["internal/presets/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: lockfile
+    root: internal/lockfile
+    kind: package
+    language: go
+    depends_on: ["config", "version"]
+    paths: ["internal/lockfile/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: gitdiff
+    root: internal/gitdiff
+    kind: package
+    language: go
+    paths: ["internal/gitdiff/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: compmap
+    root: internal/compmap
+    kind: package
+    language: go
+    depends_on: ["config"]
+    paths: ["internal/compmap/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: policy
+    root: internal/policy
+    kind: package
+    language: go
+    depends_on: ["compmap", "config", "gitdiff"]
+    paths: ["internal/policy/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: verify
+    root: internal/verify
+    kind: package
+    language: go
+    depends_on: ["compmap", "config", "gitdiff", "lockfile", "policy", "version"]
+    paths: ["internal/verify/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: upgrade
+    root: internal/upgrade
+    kind: package
+    language: go
+    depends_on: ["config", "lockfile"]
+    paths: ["internal/upgrade/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: version
+    root: internal/version
+    kind: package
+    language: go
+    paths: ["internal/version/**"]
+    checks: ["go-vet", "go-test-race"]
+  - id: schemas
+    root: schemas
+    kind: contracts
+    language: json
+    paths: ["schemas/**"]
+    checks: ["validate-schemas"]
+  - id: action
+    root: action
+    kind: github-action
+    language: yaml
+    paths: ["action/**"]
+    checks: ["go-test-race"]
+  - id: docs-and-examples
+    root: docs
+    kind: documentation
+    language: markdown
+    paths: ["docs/**", "examples/**", "README.md", "AGENTS.md", "LICENSE", ".gitignore", ".github/**", ".waypost.yaml", ".waypost.lock", "go.mod", "go.sum"]
+checks:
+  - id: go-vet
+    command: "go vet ./..."
+    paths: ["**/*.go", "go.mod", "go.sum"]
+    required: true
+    timeout_seconds: 120
+    description: "Go static analysis"
+  - id: go-test-race
+    command: "go test -race ./..."
+    paths: ["**/*.go", "internal/presets/*.yaml", "go.mod", "go.sum"]
+    required: true
+    timeout_seconds: 180
+    description: "Full Go test suite with race detector"
+  - id: validate-schemas
+    command: "python3 -c 'import glob,json; [json.load(open(f)) for f in glob.glob(\"schemas/*.json\")]'"
+    paths: ["schemas/**"]
+    required: true
+    requires_bin: "python3"
+    timeout_seconds: 30
+    description: "Validate JSON syntax of all v1 schemas"

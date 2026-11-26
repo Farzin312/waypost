@@ -1,0 +1,15 @@
+# Local developer overrides (never read in CI mode)
+.waypost.local.yaml
+.waypost/cache/
+.waypost/receipts/
+
+# Build artifacts
+/waypost
+/dist/
+coverage.out
+*.test
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/

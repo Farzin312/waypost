@@ -1,0 +1,59 @@
+schema_version: "1"
+name: example-mobile-app
+extends: "builtin:app-ts@1.0.0"
+description: "Worked example of a TypeScript Expo/React Native app with a backend OpenAPI contract pin and optional bounds provider."
+policy:
+  fail_closed_on_unmapped: true
+  require_frozen_lock_in_ci: true
+  enforce_base_floor_in_ci: true
+  trust_paths:
+    - "app.config.ts"
+    - "src/auth/**"
+components:
+  - id: api-client
+    root: src/api
+    kind: library
+    language: typescript
+    paths: ["src/api/**"]
+    checks: ["ts-typecheck", "contract-compat"]
+  - id: ui-kit
+    root: src/components
+    kind: library
+    language: typescript
+    paths: ["src/components/**"]
+    checks: ["ts-typecheck", "ts-test"]
+  - id: app-screens
+    root: app
+    kind: app
+    language: typescript
+    depends_on: ["api-client", "ui-kit"]
+    entrypoints: ["app/_layout.tsx"]
+    paths: ["app/**"]
+    checks: ["ts-typecheck", "ts-test"]
+pins:
+  - id: backend-openapi-v2
+    producer: "org/backend-service"
+    artifact: "contracts/openapi-v2.json"
+    consumer: "api-client"
+    version: "2.4.0"
+    compatibility_check: "contract-compat"
+    paths: ["src/api/**"]
+checks:
+  - id: contract-compat
+    command: "npm run test:contract"
+    paths: ["src/api/**"]
+    required: true
+    timeout_seconds: 120
+    description: "Verify API client types and payload fixtures against pinned backend contract"
+  - id: secrets-scan
+    command: "gitleaks detect --no-git --source ."
+    required: true
+    requires_bin: "gitleaks"
+    timeout_seconds: 60
+    description: "Fail-closed secret scan"
+providers:
+  - id: bounds-arch
+    tool: bounds
+    command: "bounds report --json"
+    authorized: false
+    description: "Set authorized: true and run `waypost upgrade --apply` when bounds is installed"

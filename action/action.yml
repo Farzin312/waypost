@@ -1,0 +1,87 @@
+name: "Waypost Verify"
+description: "Run fail-closed Waypost CI verification with base-branch policy floor, frozen lockfile validation, and receipt.v1.json output."
+inputs:
+  base:
+    description: "Base git ref for diff and policy floor evaluation (defaults to PR base ref or origin/main)."
+    required: false
+    default: ""
+  frozen:
+    description: "Require committed .waypost.lock to match exactly."
+    required: false
+    default: "true"
+  all:
+    description: "Force full repository verification regardless of diff scoping."
+    required: false
+    default: "false"
+  receipt-path:
+    description: "Output path for receipt.v1.json."
+    required: false
+    default: ".waypost/receipt.v1.json"
+  markdown-path:
+    description: "Output path for PR Markdown summary."
+    required: false
+    default: ".waypost/receipt.md"
+  go-version:
+    description: "Go version to build waypost when not pre-installed."
+    required: false
+    default: "1.26"
+  waypost-ref:
+    description: "Git ref or version of github.com/Farzin312/waypost to install (defaults to latest)."
+    required: false
+    default: "latest"
+outputs:
+  outcome:
+    description: "Verification summary outcome (PASS, WARN, or FAIL)."
+    value: ${{ steps.run.outputs.outcome }}
+  receipt-path:
+    description: "Path to generated receipt.v1.json."
+    value: ${{ inputs.receipt-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure waypost binary
+      shell: bash
+      run: |
+        if command -v waypost >/dev/null 2>&1; then
+          echo "Using pre-installed $(command -v waypost)"
+        else
+          echo "Installing github.com/Farzin312/waypost/cmd/waypost@${{ inputs.waypost-ref }}"
+          go install "github.com/Farzin312/waypost/cmd/waypost@${{ inputs.waypost-ref }}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Run waypost verify (CI authority)
+      id: run
+      shell: bash
+      run: |
+        BASE_REF="${{ inputs.base }}"
+        if [ -z "$BASE_REF" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+          BASE_REF="origin/${GITHUB_BASE_REF}"
+        fi
+        ARGS=(verify --mode ci --receipt "${{ inputs.receipt-path }}" --markdown "${{ inputs.markdown-path }}")
+        if [ -n "$BASE_REF" ]; then
+          ARGS+=(--base "$BASE_REF")
+        fi
+        if [ "${{ inputs.frozen }}" = "true" ]; then
+          ARGS+=(--frozen)
+        fi
+        if [ "${{ inputs.all }}" = "true" ]; then
+          ARGS+=(--all)
+        fi
+
+        set +e
+        waypost "${ARGS[@]}"
+        EXIT_CODE=$?
+        set -e
+
+        if [ -f "${{ inputs.markdown-path }}" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          cat "${{ inputs.markdown-path }}" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        OUTCOME="FAIL"
+        if [ -f "${{ inputs.receipt-path }}" ]; then
+          OUTCOME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["summary"]["outcome"])' "${{ inputs.receipt-path }}" 2>/dev/null || echo "FAIL")
+        fi
+        echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+        exit "$EXIT_CODE"

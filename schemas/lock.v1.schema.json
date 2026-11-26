@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Farzin312/waypost/blob/main/schemas/lock.v1.schema.json",
+  "title": "Waypost Lockfile v1 (.waypost.lock)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lock_version", "schema_version", "resolver_version", "config_sha256", "policy_digest"],
+  "properties": {
+    "lock_version": { "type": "string", "const": "1" },
+    "schema_version": { "type": "string", "const": "1" },
+    "resolver_version": { "type": "string", "const": "1" },
+    "config_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "policy_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref", "source", "sha256"],
+        "properties": {
+          "ref": { "type": "string" },
+          "source": { "type": "string", "enum": ["builtin", "file"] },
+          "version": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "source", "authorized"],
+        "properties": {
+          "id": { "type": "string" },
+          "source": { "type": "string" },
+          "version": { "type": "string" },
+          "kind": { "type": "string" },
+          "authorized": { "type": "boolean" }
+        }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "tool", "command", "authorized"],
+        "properties": {
+          "id": { "type": "string" },
+          "tool": { "type": "string" },
+          "command": { "type": "string" },
+          "authorized": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}
