@@ -1,11 +1,14 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"reflect"
 	"slices"
 	"sort"
 
+	"github.com/Farzin312/waypost/internal/archgraph"
 	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/gitdiff"
@@ -28,6 +31,7 @@ type BaseFloor struct {
 	RequireFrozenLockInCI   bool
 	FailClosedOnUnmapped    bool
 	AllowedProviderCommands map[string]string
+	BoundaryBaseline        *archgraph.BaselineFile
 	LoadError               string
 }
 
@@ -95,6 +99,13 @@ func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *g
 		if config.BoolVal(baseRes.Effective.Policy.FailClosedOnUnmapped, true) {
 			bf.FailClosedOnUnmapped = true
 		}
+		if b := baseRes.Effective.Boundaries; b.IsEnabled() && b.EffectiveMode() == "ratchet" {
+			baseline, err := ReadBaselineAtRef(repoDir, ref, b.BaselinePath())
+			if err != nil {
+				bf.LoadError = fmt.Sprintf("trusted base boundary baseline %q at %s: %v", b.BaselinePath(), ref, err)
+			}
+			bf.BoundaryBaseline = baseline
+		}
 		bf.AllowedProviderCommands = make(map[string]string)
 		for _, p := range baseRes.Effective.Providers {
 			if p.Authorized {
@@ -104,6 +115,46 @@ func LoadBaseFloor(repoDir, mode string, headRes *config.ResolvedConfig, snap *g
 	}
 	return bf
 }
+
+// ReadBaselineAtRef reads a committed, regular baseline from a trusted Git tree.
+func ReadBaselineAtRef(repoDir, ref, rel string) (*archgraph.BaselineFile, error) {
+	raw, found, err := gitdiff.ReadBoundedRegularFileAtRef(repoDir, ref, rel, archgraph.MaxBaselineBytes)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fs.ErrNotExist
+	}
+	return archgraph.ParseBaseline(raw)
+}
+
+func baselineTampering(repoDir, headRef string, paths []string, base *archgraph.BaselineFile) []string {
+	trusted := make(map[string]int, len(base.Entries))
+	for _, entry := range base.Entries {
+		trusted[entry.Fingerprint] = entry.Occurrences()
+	}
+	var findings []string
+	for _, rel := range paths {
+		head, err := ReadBaselineAtRef(repoDir, headRef, rel)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // Graduation can remove the baseline. Ratchet still requires it during verification.
+		}
+		if err != nil {
+			findings = append(findings, fmt.Sprintf("PR boundary baseline %q is invalid: %v", rel, err))
+			continue
+		}
+		added := 0
+		for _, entry := range head.Entries {
+			added += max(0, entry.Occurrences()-trusted[entry.Fingerprint])
+		}
+		if added > 0 {
+			findings = append(findings, fmt.Sprintf("PR expanded boundary baseline %q by %d violation occurrence(s) beyond the trusted base allowance", rel, added))
+		}
+	}
+	return findings
+}
+
+var boundaryModeStrictness = map[string]int{"enforce": 3, "ratchet": 2, "warn": 1}
 
 // PlanResult captures policy authority decisions, trust-boundary escalations,
 // base-branch policy floor enforcement, and the final check execution plan.
@@ -116,6 +167,7 @@ type PlanResult struct {
 	Impact                 compmap.Impact           `json:"impact"`
 	Checks                 []SelectedCheck          `json:"checks"`
 	EffectivePolicyDigest  string                   `json:"effective_policy_digest"`
+	BoundaryTampering      []string                 `json:"-"`
 	EffectiveBoundaries    *config.BoundariesConfig `json:"-"`
 }
 
@@ -134,6 +186,10 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 		".github/workflows/**",
 		".bounds/**",
 	}, cfg.Policy.TrustPaths...)
+	var baselinePaths []string
+	if cfg.Boundaries.EffectiveMode() == "ratchet" {
+		baselinePaths = append(baselinePaths, cfg.Boundaries.BaselinePath())
+	}
 	for _, c := range cm.Components {
 		trustPaths = append(trustPaths, c.TrustPaths...)
 	}
@@ -223,10 +279,20 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 					"PR disabled built-in architecture boundaries; base boundary policy remains enforced")
 				effectiveBoundaries.Enabled = config.BoolPtr(true)
 			}
-			if baseEff.Boundaries.EffectiveMode() == "enforce" && effectiveBoundaries.EffectiveMode() != "enforce" {
-				res.TamperingFindings = append(res.TamperingFindings,
-					"PR downgraded boundaries.mode from enforce to warn; enforce mode remains active")
-				effectiveBoundaries.Mode = "enforce"
+			baseMode, headMode := baseEff.Boundaries.EffectiveMode(), effectiveBoundaries.EffectiveMode()
+			if boundaryModeStrictness[baseMode] > boundaryModeStrictness[headMode] {
+				res.BoundaryTampering = append(res.BoundaryTampering,
+					fmt.Sprintf("PR downgraded boundaries.mode from %s to %s; %s mode remains active", baseMode, headMode, baseMode))
+				effectiveBoundaries.Mode = baseMode
+			}
+			if baseMode == "ratchet" {
+				basePath := baseEff.Boundaries.BaselinePath()
+				if !slices.Contains(baselinePaths, basePath) {
+					baselinePaths = append(baselinePaths, basePath)
+				}
+				if bf.BoundaryBaseline != nil && snap != nil && snap.HeadSHA != "" {
+					res.BoundaryTampering = append(res.BoundaryTampering, baselineTampering(repoDir, snap.HeadSHA, baselinePaths, bf.BoundaryBaseline)...)
+				}
 			}
 			if config.BoolVal(baseEff.Boundaries.NoCycles, true) && !config.BoolVal(effectiveBoundaries.NoCycles, true) {
 				res.TamperingFindings = append(res.TamperingFindings,
@@ -260,6 +326,7 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 			effectiveBoundaries.Rules = append(effectiveBoundaries.Rules, changedHeadRules...)
 		}
 
+		res.TamperingFindings = append(res.TamperingFindings, res.BoundaryTampering...)
 		if len(res.TamperingFindings) > 0 {
 			res.TrustBoundaryTriggered = true
 			res.FullRepoEscalated = true
@@ -292,7 +359,7 @@ func Plan(repoDir, mode string, resolved *config.ResolvedConfig, bf BaseFloor, c
 	// Check trust-boundary paths against ALL affected paths (both sides of renames + deletions).
 	var trustHits []string
 	for _, p := range changed {
-		if compmap.MatchAnyGlob(trustPaths, p) {
+		if slices.Contains(baselinePaths, p) || compmap.MatchAnyGlob(trustPaths, p) {
 			trustHits = append(trustHits, p)
 		}
 	}

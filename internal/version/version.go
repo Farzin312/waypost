@@ -12,7 +12,7 @@ const (
 
 // CLIVersion and Commit may be overridden at link time via -ldflags.
 var (
-	CLIVersion = "0.1.0"
+	CLIVersion = "0.2.0"
 	Commit     = "dev"
 )
 

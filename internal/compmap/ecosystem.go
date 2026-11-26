@@ -140,8 +140,38 @@ func ReadBoundedRegularFile(absRepo, targetPath string, maxBytes int) ([]byte, e
 	return raw, nil
 }
 
+// ReadSameRepoRegularFile follows symlinks for explicit legacy migration.
+func ReadSameRepoRegularFile(repo, filename string, maxBytes int) ([]byte, error) {
+	resolvedRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Lstat(filename); err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(filename)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve legacy file %q: %v", filename, err)
+	}
+	if err := insideRepo(resolvedRepo, resolved); err != nil {
+		return nil, err
+	}
+	if resolved == resolvedRepo {
+		return nil, fmt.Errorf("%q resolves to the repository directory", filename)
+	}
+	return ReadBoundedRegularFile(resolvedRepo, resolved, maxBytes)
+}
+
 // LoadBoundsProject reads legacy manifests and retains their interface metadata for migration.
 func LoadBoundsProject(absRepo string, allowedFiles map[string]bool) (*BoundsProject, error) {
+	return loadBoundsProject(absRepo, allowedFiles, ReadBoundedRegularFile)
+}
+
+func LoadBoundsProjectForMigration(absRepo string) (*BoundsProject, error) {
+	return loadBoundsProject(absRepo, nil, ReadSameRepoRegularFile)
+}
+
+func loadBoundsProject(absRepo string, allowedFiles map[string]bool, readManifest func(string, string, int) ([]byte, error)) (*BoundsProject, error) {
 	result := &BoundsProject{}
 	var root struct {
 		Enforce    string   `yaml:"enforce"`
@@ -193,7 +223,7 @@ func LoadBoundsProject(absRepo string, allowedFiles map[string]bool) (*BoundsPro
 		if allowedFiles != nil && !allowedFiles[rel] {
 			continue
 		}
-		raw, err := ReadBoundedRegularFile(absRepo, filepath.Join(manifestsDir, e.Name()), MaxStaticDiscoveryBytes)
+		raw, err := readManifest(absRepo, filepath.Join(manifestsDir, e.Name()), MaxStaticDiscoveryBytes)
 		if err != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", rel, err))
 			continue

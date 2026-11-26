@@ -163,3 +163,43 @@ func TestBoundedReaderRejectsSymlinksEscapesAndOversizedManifests(t *testing.T) 
 		t.Fatalf("symlink legacy root: %v", err)
 	}
 }
+
+func TestBoundsMigrationFollowsOnlySameRepoFileSymlinks(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		".bounds/root.yaml": "enforce: 'on'\n",
+		"legacy/ignore":     "src/generated/\n",
+		"legacy/api.yaml":   "name: api\npaths: [src/api]\n",
+	})
+	mustWrite(t, filepath.Join(outside, "outside.yaml"), "name: escaped\npaths: [src/escaped]\n")
+	if err := os.MkdirAll(filepath.Join(dir, ".bounds/manifests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ignore := filepath.Join(dir, ".bounds/ignore")
+	if err := os.Symlink("../legacy/ignore", ignore); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "legacy/api.yaml"), filepath.Join(dir, ".bounds/manifests/api.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "outside.yaml"), filepath.Join(dir, ".bounds/manifests/outside.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := MigrateFromBounds(dir)
+	if err != nil || migration.Subsystems != 1 || migration.Components[0].ID != "api" ||
+		!slices.Equal(migration.Boundaries.IgnorePaths, []string{"src/generated/**"}) ||
+		len(migration.Warnings) != 1 || !strings.Contains(migration.Warnings[0], "outside repository") {
+		t.Fatalf("unexpected migration: %+v, %v", migration, err)
+	}
+	for _, target := range []string{filepath.Join(outside, "outside.yaml"), filepath.Join(outside, "missing")} {
+		if err := os.Remove(ignore); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, ignore); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := MigrateFromBounds(dir); err == nil {
+			t.Fatalf("accepted escaping ignore %q", target)
+		}
+	}
+}

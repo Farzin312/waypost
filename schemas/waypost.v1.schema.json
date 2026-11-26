@@ -140,8 +140,27 @@
           "type": "string",
           "enum": [
             "enforce",
+            "ratchet",
             "warn"
           ]
+        },
+        "baseline": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/\\\\:\\x00]+(/[^/\\\\:\\x00]+)*$",
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(^|/)\\.{1,2}(/|$)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "^\\.([gG][iI\u0130][tT]|[wW][aA][yY][pP][oO][sS][tT]\\.([yY][aA][mM][lL]|[lL][oO][cC][aA][lL]\\.[yY][aA][mM][lL]|[lL][oO][cC][kK\u212a]))(/|$)"
+              }
+            }
+          ],
+          "description": "Repository-relative baseline file. Defaults to .waypost.baseline.json in ratchet mode."
         },
         "no_cycles": {
           "type": "boolean"

@@ -29,6 +29,14 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 		path = "$"
 	}
 
+	if requirements, ok := schema["allOf"].([]any); ok {
+		for _, candidate := range requirements {
+			errs = append(errs, validateAgainstSchema(candidate.(map[string]any), val, path)...)
+		}
+	}
+	if forbidden, ok := schema["not"].(map[string]any); ok && len(validateAgainstSchema(forbidden, val, path)) == 0 {
+		errs = append(errs, fmt.Sprintf("%s: matched a forbidden schema", path))
+	}
 	if alternatives, ok := schema["anyOf"].([]any); ok {
 		matched := false
 		for _, candidate := range alternatives {
@@ -122,14 +130,6 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 			if ml, ok := schema["minLength"].(float64); ok && len(s) < int(ml) {
 				errs = append(errs, fmt.Sprintf("%s: string len %d < minLength %d", path, len(s), int(ml)))
 			}
-			if pat, ok := schema["pattern"].(string); ok && pat != "" {
-				re, err := regexp.Compile(pat)
-				if err != nil {
-					errs = append(errs, fmt.Sprintf("%s: invalid schema pattern %q: %v", path, pat, err))
-				} else if !re.MatchString(s) {
-					errs = append(errs, fmt.Sprintf("%s: string %q does not match pattern %q", path, s, pat))
-				}
-			}
 		case "boolean":
 			if _, ok := val.(bool); !ok {
 				errs = append(errs, fmt.Sprintf("%s: expected boolean, got %T", path, val))
@@ -140,6 +140,14 @@ func validateAgainstSchema(schema map[string]any, val any, path string) []string
 				errs = append(errs, fmt.Sprintf("%s: expected integer, got %T (%v)", path, val, val))
 			} else if minV, ok := schema["minimum"].(float64); ok && f < minV {
 				errs = append(errs, fmt.Sprintf("%s: value %v < minimum %v", path, f, minV))
+			}
+		}
+	}
+	if s, ok := val.(string); ok {
+		if pat, ok := schema["pattern"].(string); ok && pat != "" {
+			re := regexp.MustCompile(pat)
+			if !re.MatchString(s) {
+				errs = append(errs, fmt.Sprintf("%s: string %q does not match pattern %q", path, s, pat))
 			}
 		}
 	}
@@ -744,5 +752,53 @@ func TestPolyglotExampleFrozenLock(t *testing.T) {
 	}
 	if lock := lockfile.Verify(dir, res); !lock.Valid {
 		t.Fatalf("example's frozen lock is invalid: %v", lock.Mismatches)
+	}
+	const originalDigest = "236c164a29236f19fd1cf95bc34fea605ebda5796b505cb4f7a90e2b91524d0f"
+	if res.PolicyDigest != originalDigest {
+		t.Fatalf("example policy digest changed: got %s, want %s", res.PolicyDigest, originalDigest)
+	}
+}
+
+func TestRatchetBoundarySchemaConformance(t *testing.T) {
+	schema := loadJSONSchema(t, filepath.Join("..", "..", "schemas", "waypost.v1.schema.json"))
+	for _, tc := range []struct {
+		body, path string
+		valid      bool
+	}{
+		{"{enabled: true, mode: ratchet}", config.DefaultBaselinePath, true},
+		{"{enabled: true, mode: ratchet, baseline: architecture/debt.json}", "architecture/debt.json", true},
+		{"{enabled: true, mode: ratchet, baseline: .waypost.baseline.json}", config.DefaultBaselinePath, true},
+		{"{enabled: true, mode: ratchet, baseline: dir/.git/report..json}", "dir/.git/report..json", true},
+		{"{enabled: true, mode: ratchet, baseline: ''}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: ../x}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: /abs}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: .git/config}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: .GiT/config}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: C:/x}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: dir/../x}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: dir/./x}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: dir//x}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: dir/}", "", false},
+		{`{enabled: true, mode: ratchet, baseline: 'dir\x'}`, "", false},
+		{"{enabled: true, mode: ratchet, baseline: .WAYPOST.YAML}", "", false},
+		{"{enabled: true, mode: unknown}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: 123}", "", false},
+		{"{enabled: true, mode: ratchet, baseline: null}", "", false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			raw := []byte("schema_version: '1'\nboundaries: " + tc.body + "\n")
+			var doc any
+			if err := yaml.Unmarshal(raw, &doc); err != nil {
+				t.Fatal(err)
+			}
+			problems := validateAgainstSchema(schema, doc, "")
+			cfg, err := config.ParseBytes(raw, "ratchet fixture")
+			if (len(problems) == 0) != tc.valid || (err == nil) != tc.valid {
+				t.Fatalf("valid=%t, schema errors=%v, config error=%v", tc.valid, problems, err)
+			}
+			if tc.valid && (cfg.Boundaries.EffectiveMode() != "ratchet" || cfg.Boundaries.BaselinePath() != tc.path) {
+				t.Fatalf("unexpected effective baseline config: %+v", cfg.Boundaries)
+			}
+		})
 	}
 }

@@ -314,3 +314,28 @@ func runGitBytes(repoDir string, args ...string) ([]byte, error) {
 	}
 	return stdout.Bytes(), nil
 }
+
+// ReadBoundedRegularFileAtRef checks the Git tree entry before reading its blob.
+func ReadBoundedRegularFileAtRef(repoDir, ref, relPath string, maxBytes int) ([]byte, bool, error) {
+	if !filepath.IsLocal(relPath) || relPath == "." || filepath.ToSlash(filepath.Clean(relPath)) != relPath {
+		return nil, false, fmt.Errorf("invalid repository path %q", relPath)
+	}
+	out, err := runGitBytes(repoDir, "ls-tree", "-l", "-z", ref, "--", ":(literal)"+relPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(out) == 0 {
+		return nil, false, nil
+	}
+	meta, name, ok := strings.Cut(strings.TrimSuffix(string(out), "\x00"), "\t")
+	fields := strings.Fields(meta)
+	if !ok || name != relPath || len(fields) != 4 || fields[1] != "blob" ||
+		(fields[0] != "100644" && fields[0] != "100755") {
+		return nil, false, fmt.Errorf("%q at %s is not a regular file", relPath, ref)
+	}
+	size, err := strconv.ParseInt(fields[3], 10, 64)
+	if err != nil || size < 0 || size > int64(maxBytes) {
+		return nil, false, fmt.Errorf("%q at %s exceeds %d bytes", relPath, ref, maxBytes)
+	}
+	return ReadFileAtRef(repoDir, ref, relPath)
+}

@@ -66,8 +66,10 @@ type scanResult struct {
 // AnalyzeOptions optionally restricts scanning to a repository-relative file inventory.
 // A nil allowlist scans the live tree.
 type AnalyzeOptions struct {
-	AllowedFiles      map[string]bool
-	AllowMissingFiles bool // Local inventories can include files deleted from the worktree.
+	AllowedFiles        map[string]bool
+	SkipNonRegularFiles bool                                        // Inference only needs materialized regular inputs.
+	AllowMissingFiles   bool                                        // Local inventories can include files deleted from the worktree.
+	BaselineReader      func(relPath string) (*BaselineFile, error) // Defaults to reading the worktree.
 }
 
 type goModuleInfo struct {
@@ -103,6 +105,11 @@ func scanRepoImports(repo string, cm *compmap.Map, ignore []string, opts Analyze
 			return
 		}
 		dir, base := path.Dir(rel), path.Base(rel)
+		if opts.SkipNonRegularFiles {
+			if info, err := os.Lstat(filepath.Join(repo, rel)); err == nil && !info.Mode().IsRegular() {
+				return
+			}
+		}
 		switch base {
 		case "tsconfig.json", "tsconfig.base.json", "jsconfig.json":
 			if opts.AllowMissingFiles {
@@ -459,4 +466,40 @@ func resolveGoPackage(from, spec string, modules []goModuleInfo, packages map[st
 		}
 	}
 	return target
+}
+
+// WalkSourceFiles visits regular supported source files without reading their contents.
+func WalkSourceFiles(repo string, cm *compmap.Map, ignore []string, visit func(rel, language string)) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return fs.WalkDir(root.FS(), ".", func(rel string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if rel != "." && (skipScanDir(cm, rel) || compmap.MatchAnyGlob(ignore, rel)) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() || !isSupportedSource(rel) || compmap.MatchAnyGlob(ignore, rel) {
+			return nil
+		}
+		language := "javascript"
+		switch strings.ToLower(path.Ext(rel)) {
+		case ".ts", ".tsx", ".mts", ".cts":
+			language = "typescript"
+		case ".go":
+			language = "go"
+		case ".py":
+			language = "python"
+		case ".rs":
+			language = "rust"
+		}
+		visit(rel, language)
+		return nil
+	})
 }

@@ -18,9 +18,12 @@ import (
 
 // Options controls a preset/lockfile upgrade run.
 type Options struct {
-	Target  string // Optional new `extends` reference
-	Apply   bool   // False = dry-run (default)
-	Offline bool   // Restrict remote preset resolution to verified local cache
+	Target            string                                 // Optional new `extends` reference
+	CandidateConfig   []byte                                 // Optional edited YAML to publish with its lock.
+	ExpectedConfigSHA string                                 // Reject edits based on a stale config snapshot.
+	Apply             bool                                   // False = dry-run (default)
+	Offline           bool                                   // Restrict remote preset resolution to verified local cache
+	ReadFile          func(repo, rel string) ([]byte, error) // Optional reader for the configuration and lock.
 }
 
 // Plan reports the exact reviewable delta of upgrading inheritance/lockfile state.
@@ -47,14 +50,31 @@ type Plan struct {
 // .waypost.yaml (if Target changed) and .waypost.lock using exclusively created
 // temporary files with rollback on error so git revert remains clean.
 func Run(repoDir string, opts Options) (*Plan, error) {
+	readFile := opts.ReadFile
+	if readFile == nil {
+		readFile = func(repo, rel string) ([]byte, error) { return os.ReadFile(filepath.Join(repo, rel)) }
+	}
 	cfgPath := filepath.Join(repoDir, config.ConfigFileName)
-	rawBefore, err := os.ReadFile(cfgPath)
+	rawBefore, err := readFile(repoDir, config.ConfigFileName)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", cfgPath, err)
 	}
+	if len(rawBefore) == 0 {
+		return nil, fmt.Errorf("%s is empty", cfgPath)
+	}
 
-	prevLock, prevLockDigest, _ := lockfile.Read(repoDir)
-	prevLockRaw, _ := os.ReadFile(filepath.Join(repoDir, lockfile.LockFileName))
+	if opts.ExpectedConfigSHA != "" && fmt.Sprintf("%x", sha256.Sum256(rawBefore)) != opts.ExpectedConfigSHA {
+		return nil, fmt.Errorf("%s changed during sync; rerun waypost sync", config.ConfigFileName)
+	}
+	if opts.Target != "" && opts.CandidateConfig != nil {
+		return nil, fmt.Errorf("target extends and candidate config are mutually exclusive")
+	}
+
+	prevLockRaw, err := readFile(repoDir, lockfile.LockFileName)
+	if opts.ReadFile != nil && err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read %s: %w", lockfile.LockFileName, err)
+	}
+	prevLock, prevLockDigest, _ := lockfile.ParseBytes(prevLockRaw)
 	pinnedPrev := lockfile.PinnedRemoteSHAs(prevLock)
 
 	// Prefer loading the previously locked remote snapshot from local cache for accurate
@@ -65,6 +85,7 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	if len(pinnedPrev) > 0 {
 		beforeRes, err = config.Load(repoDir, config.LoadOptions{
 			Mode:                "ci",
+			OverrideRootRaw:     rawBefore,
 			PinnedRemoteSHAs:    pinnedPrev,
 			RequirePinnedRemote: true,
 			Offline:             true,
@@ -76,8 +97,9 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 	if beforeRes == nil {
 		beforeRes, err = config.Load(repoDir, config.LoadOptions{
-			Mode:    "ci",
-			Offline: opts.Offline,
+			Mode:            "ci",
+			OverrideRootRaw: rawBefore,
+			Offline:         opts.Offline,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("load current config: %w", err)
@@ -85,6 +107,9 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 	}
 
 	rawAfter := rawBefore
+	if opts.CandidateConfig != nil {
+		rawAfter = opts.CandidateConfig
+	}
 	targetExt := strings.TrimSpace(opts.Target)
 	if targetExt != "" && targetExt != beforeRes.Effective.Extends {
 		rawAfter, err = replaceExtendsField(rawBefore, targetExt)
@@ -101,9 +126,9 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 		OverrideLabel:   cfgPath + " (candidate)",
 		Offline:         opts.Offline,
 	}
-	if opts.Offline {
+	if opts.Offline || opts.CandidateConfig != nil {
 		afterLoadOpts.PinnedRemoteSHAs = pinnedPrev
-		afterLoadOpts.RequirePinnedRemote = true
+		afterLoadOpts.RequirePinnedRemote = opts.Offline
 	}
 	afterRes, err := config.Load(repoDir, afterLoadOpts)
 	if err != nil {
@@ -251,7 +276,14 @@ func Run(repoDir string, opts Options) (*Plan, error) {
 			_ = os.Remove(lockTmp)
 			// Roll back config file if lock publish failed.
 			if cfgChanged {
-				_ = os.WriteFile(cfgPath, rawBefore, 0o644)
+				if rollback, rollbackErr := stageTempFile(repoDir, ".waypost-cfg-*.tmp", rawBefore); rollbackErr == nil {
+					defer os.Remove(rollback)
+					if rollbackErr := os.Rename(rollback, cfgPath); rollbackErr != nil {
+						return nil, fmt.Errorf("publish lockfile: %w; restore config: %v", err, rollbackErr)
+					}
+				} else {
+					return nil, fmt.Errorf("publish lockfile: %w; stage config rollback: %v", err, rollbackErr)
+				}
 			}
 			return nil, fmt.Errorf("publish updated lockfile: %w", err)
 		}

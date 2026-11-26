@@ -27,7 +27,7 @@ func MigrateFromBounds(repoDir string) (*BoundsMigration, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := compmap.LoadBoundsProject(absRepo, nil)
+	project, err := compmap.LoadBoundsProjectForMigration(absRepo)
 	if err != nil {
 		return nil, fmt.Errorf("load .bounds: %w", err)
 	}
@@ -43,7 +43,7 @@ func MigrateFromBounds(repoDir string) (*BoundsMigration, error) {
 
 	ignores := make(map[string]bool)
 	for _, name := range []string{".bounds/ignore", ".boundsignore"} {
-		raw, err := compmap.ReadBoundedRegularFile(absRepo, filepath.Join(absRepo, name), maxSourceFileBytes)
+		raw, err := compmap.ReadSameRepoRegularFile(absRepo, filepath.Join(absRepo, name), maxSourceFileBytes)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}

@@ -150,11 +150,41 @@ type ResolvedConfig struct {
 // replacing external boundary tools with live zero-cache static import analysis.
 type BoundariesConfig struct {
 	Enabled             *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Mode                string         `yaml:"mode,omitempty" json:"mode,omitempty"` // "enforce" (default) | "warn"
+	Mode                string         `yaml:"mode,omitempty" json:"mode,omitempty"` // "enforce" (default) | "ratchet" | "warn"
+	Baseline            string         `yaml:"baseline,omitempty" json:"baseline,omitempty"`
 	NoCycles            *bool          `yaml:"no_cycles,omitempty" json:"no_cycles,omitempty"`
 	EnforceDeclaredDeps *bool          `yaml:"enforce_declared_deps,omitempty" json:"enforce_declared_deps,omitempty"`
 	IgnorePaths         []string       `yaml:"ignore_paths,omitempty" json:"ignore_paths,omitempty"`
 	Rules               []BoundaryRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+func (b *BoundariesConfig) UnmarshalYAML(node *yaml.Node) error {
+	// Decode the effective mapping through yaml.v3 so aliases, merge keys,
+	// and explicit overrides follow the same rules as ordinary config fields.
+	var fields map[string]yaml.Node
+	if err := node.Decode(&fields); err != nil {
+		return err
+	}
+	for key, value := range fields {
+		switch key {
+		case "baseline":
+			if value.ShortTag() != "!!str" {
+				return fmt.Errorf("line %d: boundaries.baseline must be a string", value.Line)
+			}
+			var baseline string
+			if err := value.Decode(&baseline); err != nil {
+				return err
+			}
+			if !validBaselinePath(baseline) {
+				return fmt.Errorf("line %d: boundaries.baseline %q must be a repository-relative file path", value.Line, baseline)
+			}
+		case "enabled", "mode", "no_cycles", "enforce_declared_deps", "ignore_paths", "rules":
+		default:
+			return fmt.Errorf("line %d: unknown boundaries field %q", value.Line, key)
+		}
+	}
+	type plainBoundaries BoundariesConfig
+	return node.Decode((*plainBoundaries)(b))
 }
 
 // IsEnabled reports whether built-in boundary enforcement is active during verification.
@@ -162,12 +192,22 @@ func (b *BoundariesConfig) IsEnabled() bool {
 	return b != nil && BoolVal(b.Enabled, false)
 }
 
-// EffectiveMode returns "enforce" or "warn" (defaults to "enforce").
+// EffectiveMode defaults to enforce.
 func (b *BoundariesConfig) EffectiveMode() string {
-	if b != nil && b.Mode == "warn" {
-		return "warn"
+	if b != nil && (b.Mode == "warn" || b.Mode == "ratchet") {
+		return b.Mode
 	}
 	return "enforce"
+}
+
+const DefaultBaselinePath = ".waypost.baseline.json"
+
+// BaselinePath returns the configured or default repository-relative baseline path.
+func (b *BoundariesConfig) BaselinePath() string {
+	if b != nil && b.Baseline != "" {
+		return b.Baseline
+	}
+	return DefaultBaselinePath
 }
 
 // BoundaryRule defines a declarative architectural import constraint between components.

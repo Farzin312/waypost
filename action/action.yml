@@ -26,9 +26,13 @@ inputs:
     required: false
     default: "1.26"
   waypost-ref:
-    description: "Git ref or version of github.com/Farzin312/waypost to install (defaults to latest)."
+    description: "Release tag or Git ref of github.com/Farzin312/waypost to install."
     required: false
-    default: "latest"
+    default: "v0.2.0"
+  sync-check:
+    description: "Fail if waypost sync detects actionable drift."
+    required: false
+    default: "false"
 outputs:
   outcome:
     description: "Verification summary outcome (PASS, WARN, or FAIL)."
@@ -50,14 +54,72 @@ runs:
           echo "found=false" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Set up Go
+    - name: Download and verify Waypost release
+      id: download
       if: steps.check_bin.outputs.found != 'true'
-      uses: actions/setup-go@v5
+      shell: bash
+      env:
+        WAYPOST_REF: ${{ inputs.waypost-ref }}
+      run: |
+        if [[ ! "$WAYPOST_REF" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]]; then
+          exit 0
+        fi
+        TEMP_DIR="$RUNNER_TEMP"
+        EXT=""
+        case "$RUNNER_OS" in
+          Linux) OS=linux ;;
+          macOS) OS=darwin ;;
+          Windows) OS=windows; EXT=".exe"; TEMP_DIR="$(cygpath -u "$TEMP_DIR")" ;;
+          *) exit 0 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64) ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          *) exit 0 ;;
+        esac
+
+        ASSET="waypost-${OS}-${ARCH}${EXT}"
+        RELEASE="https://github.com/Farzin312/waypost/releases/download/$WAYPOST_REF"
+        INSTALL_DIR="$(mktemp -d "$TEMP_DIR/waypost.XXXXXX")"
+        if ! curl --fail --silent --show-error --location --proto '=https' --max-time 30 \
+          --output "$INSTALL_DIR/$ASSET" "$RELEASE/$ASSET"; then
+          echo "Release binary unavailable. Falling back to go install."
+          exit 0
+        fi
+        if ! curl --fail --silent --show-error --location --proto '=https' --max-time 30 \
+          --output "$INSTALL_DIR/SHA256SUMS.txt" "$RELEASE/SHA256SUMS.txt"; then
+          echo "Release checksums unavailable. Falling back to go install."
+          exit 0
+        fi
+        EXPECTED="$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1 }' "$INSTALL_DIR/SHA256SUMS.txt")"
+        if [[ ! "$EXPECTED" =~ ^[[:xdigit:]]{64}$ ]]; then
+          echo "::error::Missing or ambiguous SHA-256 checksum for $ASSET"
+          exit 1
+        fi
+        (
+          cd "$INSTALL_DIR"
+          if command -v sha256sum >/dev/null 2>&1; then
+            printf '%s  %s\n' "$EXPECTED" "$ASSET" | sha256sum --check -
+          else
+            printf '%s  %s\n' "$EXPECTED" "$ASSET" | shasum -a 256 --check -
+          fi
+        )
+        mv "$INSTALL_DIR/$ASSET" "$INSTALL_DIR/waypost$EXT"
+        chmod +x "$INSTALL_DIR/waypost$EXT"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          INSTALL_DIR="$(cygpath -w "$INSTALL_DIR")"
+        fi
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        echo "found=true" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Go
+      if: steps.check_bin.outputs.found != 'true' && steps.download.outputs.found != 'true'
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
       with:
         go-version: ${{ inputs.go-version }}
 
     - name: Install waypost binary
-      if: steps.check_bin.outputs.found != 'true'
+      if: steps.check_bin.outputs.found != 'true' && steps.download.outputs.found != 'true'
       shell: bash
       env:
         WAYPOST_REF: ${{ inputs.waypost-ref }}
@@ -114,3 +176,15 @@ runs:
         fi
         echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
         exit "$EXIT_CODE"
+
+    - name: Check Waypost drift
+      if: ${{ !cancelled() && inputs.sync-check == 'true' && (steps.run.outcome == 'success' || steps.run.outcome == 'failure') }}
+      shell: bash
+      env:
+        INPUT_FROZEN: ${{ inputs.frozen }}
+      run: |
+        ARGS=(sync --check)
+        if [ "$INPUT_FROZEN" = "true" ]; then
+          ARGS+=(--offline)
+        fi
+        waypost "${ARGS[@]}"

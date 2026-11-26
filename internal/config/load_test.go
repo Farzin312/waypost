@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -133,5 +134,47 @@ func TestBoundaryInheritanceDoesNotMutateParent(t *testing.T) {
 	}
 	if parent.Mode != "" || parent.Rules[0].From != "base" || !slices.Equal(parent.IgnorePaths, []string{"base/**"}) {
 		t.Fatalf("mutation of inherited boundary policy: %+v", parent)
+	}
+}
+
+func TestRatchetBaselinePathValidation(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	baseline := "schema_version: '1'\nboundaries: {enabled: true, mode: ratchet, baseline: '%s'}\n"
+	for _, rel := range []string{"/tmp/baseline.json", "../baseline.json", "policy/../baseline.json", "C:/escape.json", ".git/config", "policy//baseline.json"} {
+		if _, err := ParseBytes([]byte(fmt.Sprintf(baseline, rel)), "fixture"); err == nil {
+			t.Fatalf("accepted unsafe baseline path %q", rel)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "policies")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	raw := []byte(fmt.Sprintf(baseline, "policies/baseline.json"))
+	if _, err := Load(dir, LoadOptions{Mode: "ci", OverrideRootRaw: raw}); err == nil {
+		t.Fatal("worktree config accepted baseline path through escaping parent")
+	}
+	// The same path may be regular on the base branch. Resolving trusted config
+	// from Git must not validate it against the PR's filesystem.
+	reader := func(string) ([]byte, bool, error) { return nil, false, nil }
+	if _, err := Load(dir, LoadOptions{Mode: "ci", OverrideRootRaw: raw, RepoFileReader: reader}); err != nil {
+		t.Fatalf("trusted config consulted the worktree: %v", err)
+	}
+}
+
+func TestBoundariesYAMLMerge(t *testing.T) {
+	cfg, err := ParseBytes([]byte(`schema_version: '1'
+boundaries:
+  <<: [&preferred {enabled: true, mode: warn, baseline: tests/debt.json}, {enabled: false, no_cycles: false}]
+  mode: ratchet
+`), "merged boundaries")
+	if err != nil || !cfg.Boundaries.IsEnabled() || cfg.Boundaries.EffectiveMode() != "ratchet" ||
+		cfg.Boundaries.BaselinePath() != "tests/debt.json" || BoolVal(cfg.Boundaries.NoCycles, true) {
+		t.Fatalf("YAML merge lost fields or override precedence: %+v, %v", cfg, err)
+	}
+	for _, merged := range []string{"{baseline: 123}", "{baseline: null}", "{baseline: ''}", "{unknown: true}"} {
+		raw := []byte("schema_version: '1'\nboundaries: {<<: " + merged + "}\n")
+		if _, err := ParseBytes(raw, "invalid merged boundaries"); err == nil {
+			t.Fatalf("accepted invalid merged fields: %s", merged)
+		}
 	}
 }

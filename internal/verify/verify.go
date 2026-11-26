@@ -217,6 +217,9 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 		tracked, inventoryErr = gitdiff.ListTrackedFiles(repoDir)
 		if mode == "ci" {
 			scanOptions.AllowedFiles = fileInventory(tracked)
+			scanOptions.BaselineReader = func(relPath string) (*archgraph.BaselineFile, error) {
+				return policy.ReadBaselineAtRef(repoDir, snap.HeadSHA, relPath)
+			}
 		} else {
 			working, err := gitdiff.ListWorkingFiles(repoDir)
 			if err == nil {
@@ -240,7 +243,7 @@ func Run(repoDir string, opts Options) (*Receipt, error) {
 	// Boundary checks run on static maps before any provider or shell command can mutate the tree.
 	var boundaryCheck *CheckResult
 	if len(preflightFailures) == 0 && plan.EffectiveBoundaries.IsEnabled() {
-		check := checkBoundaries(repoDir, cm, plan.EffectiveBoundaries, baseFloor, snap, scanOptions, inventoryErr)
+		check := checkBoundaries(repoDir, cm, plan, baseFloor, snap, scanOptions, inventoryErr)
 		boundaryCheck = &check
 	}
 	if allowProviders && len(resolved.Effective.Providers) > 0 {
@@ -364,9 +367,10 @@ func fileInventory(files []string) map[string]bool {
 	return inventory
 }
 
-func checkBoundaries(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfig, floor policy.BaseFloor, snap *gitdiff.Snapshot, opts archgraph.AnalyzeOptions, inventoryErr error) CheckResult {
+func checkBoundaries(repoDir string, cm *compmap.Map, plan *policy.PlanResult, floor policy.BaseFloor, snap *gitdiff.Snapshot, opts archgraph.AnalyzeOptions, inventoryErr error) CheckResult {
 	start := time.Now()
-	required := boundaries.EffectiveMode() == "enforce"
+	boundaries := plan.EffectiveBoundaries
+	required := boundaries.EffectiveMode() != "warn"
 	check := CheckResult{ID: "waypost-boundaries", Command: "waypost graph --check-boundaries (built-in)", Required: required}
 	baseEnforced := floor.Loaded && floor.Enforced && floor.BaseConfig != nil && floor.BaseConfig.Effective.Boundaries.IsEnabled()
 	check.FromBaseFloor = baseEnforced
@@ -383,14 +387,23 @@ func checkBoundaries(repoDir string, cm *compmap.Map, boundaries *config.Boundar
 		check.Reason = "boundary analysis error: " + err.Error()
 		return check
 	}
-	if len(violations) == 0 {
+	if len(violations) == 0 && len(plan.BoundaryTampering) == 0 {
 		check.Status = StatusPass
 		check.ExitCode = 0
 		check.Reason = fmt.Sprintf("0 violations (%d files, %d imports, %d edges)", report.FilesScanned, report.ImportsScanned, len(report.Edges))
+		if report.BoundariesMode == "ratchet" {
+			check.Reason += fmt.Sprintf("; %d grandfathered, %d resolved", report.GrandfatheredCount, report.ResolvedBaselineCount)
+		}
 		return check
 	}
 	check.Reason = fmt.Sprintf("%d boundary violation(s)", len(violations))
-	var lines []string
+	if report.BoundariesMode == "ratchet" {
+		check.Reason += fmt.Sprintf("; %d grandfathered, %d resolved", report.GrandfatheredCount, report.ResolvedBaselineCount)
+	}
+	if len(plan.BoundaryTampering) > 0 {
+		check.Reason += "; boundary policy floor tampering"
+	}
+	lines := slices.Clone(plan.BoundaryTampering)
 	for i, violation := range violations {
 		if i >= 12 {
 			lines = append(lines, fmt.Sprintf("... +%d more violations", len(violations)-12))
@@ -467,30 +480,51 @@ func collectBoundaryViolations(repoDir string, cm *compmap.Map, boundaries *conf
 		if err != nil {
 			return nil, nil, fmt.Errorf("build trusted base component map: %w", err)
 		}
-		baseReport, err := archgraph.AnalyzeWithOptions(repoDir, baseMap, base.Boundaries, opts)
+		baseOpts := opts
+		baseOpts.BaselineReader = func(string) (*archgraph.BaselineFile, error) {
+			return floor.BoundaryBaseline, nil
+		}
+		baseReport, err := archgraph.AnalyzeWithOptions(repoDir, baseMap, base.Boundaries, baseOpts)
 		if err != nil {
 			return nil, nil, fmt.Errorf("scan trusted base boundary policy: %w", err)
 		}
-		violations = append(violations, baseReport.Violations...)
+		if baseReport.BoundariesMode != "warn" || boundaries.EffectiveMode() == "warn" {
+			violations = append(violations, baseReport.Violations...)
+		}
 	}
 	report, err := archgraph.AnalyzeWithOptions(repoDir, cm, boundaries, opts)
 	if err != nil {
 		return nil, nil, err
 	}
-	seen := make(map[archgraph.Violation]bool)
-	merged := make([]archgraph.Violation, 0, len(violations)+len(report.Violations))
-	for _, v := range slices.Concat(violations, report.Violations) {
-		key := v
-		key.Severity = ""
-		if v.Kind != "scan-error" && v.Kind != "cycle" {
-			key.Message = ""
+	type violationKey struct {
+		fingerprint, detail string
+		line                int
+	}
+	keyOf := func(v archgraph.Violation) violationKey {
+		key := violationKey{archgraph.ViolationFingerprint(v), v.Specifier, v.Line}
+		switch v.Kind {
+		case "cycle":
+			key.detail, key.line = "", 0
+		case "scan-error":
+			key.detail = v.Message
 		}
-		if !seen[key] {
-			seen[key] = true
-			merged = append(merged, v)
+		return key
+	}
+	// Both scans can report the same imports. Match those occurrences one for
+	// one so repeated imports in either scan retain their multiplicity.
+	baseCounts := make(map[violationKey]int)
+	for _, v := range violations {
+		baseCounts[keyOf(v)]++
+	}
+	for _, v := range report.Violations {
+		key := keyOf(v)
+		if baseCounts[key] > 0 {
+			baseCounts[key]--
+		} else {
+			violations = append(violations, v)
 		}
 	}
-	return report, merged, nil
+	return report, violations, nil
 }
 
 func executeCheck(repoDir string, sc policy.SelectedCheck) CheckResult {

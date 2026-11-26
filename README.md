@@ -76,12 +76,33 @@ waypost graph --mermaid
 - Enforces declarative `boundaries:` rules (`no_cycles`, `enforce_declared_deps`, `allow_depends_on`, `deny_depends_on`, `public_entrypoints`, `ignore_paths`) inside `waypost verify` as a built-in `waypost-boundaries` check protected by the CI base-branch policy floor.
 - Migrates legacy `.bounds/` repositories cleanly in one command: `waypost init --from-bounds`.
 
+For an existing repository with boundary debt, enable `boundaries.enabled: true` and set
+`boundaries.mode: ratchet`. Run `waypost graph --update-baseline` to seed and review
+`.waypost.baseline.json`, or set `boundaries.baseline` to a custom repository-relative path.
+CI fails on new violations and uses the base branch's baseline to reject PRs that expand it.
+Fingerprints survive line-number changes. Use `waypost sync --apply` after fixing old
+violations to shrink the baseline or switch to `enforce` when none remain.
+
 Reports:
 - **Components** with explicit provenance (`declared | inferred | tool-observed`), `depends_on`, reverse `depended_by` (*what builds on this component*), and cycle warnings
 - **Cross-repo pins** (`producer`, `artifact`, `consumer`, `compatibility_check`)
 - **Ecosystem & local AAIF skills** (`AGENTS.md`, `CLAUDE.md`, `.bounds`, `gitleaks`, `.agents/skills/*/SKILL.md`, and duplicate `.claude/skills/` warnings)
 - **Rules** classified as `invariant` (permanent) vs `crutch` (model-era guidance eligible for pruning)
 - **Honest gaps:** explicit `unmapped_paths` and `coverage_gaps`
+
+### Keep the repository contract current
+
+```bash
+waypost sync               # Preview drift
+waypost sync --check       # Fail on actionable drift
+waypost sync --apply       # Apply safe updates and refresh the frozen lock
+```
+
+Sync discovers unowned source directories, stale components, changed package pins,
+and missing check scripts. Apply preserves YAML comments and updates the contract
+and baseline where it can. Missing scripts and referenced stale components need
+a manual fix. Unwired scripts are advisory. `waypost context` includes a
+`sync_drift` section only when there is something to fix.
 
 ### Verify deterministically (local or CI)
 
@@ -135,7 +156,11 @@ Use the included composite action in `.github/workflows/ci.yml`:
 - uses: Farzin312/waypost/action@main
   with:
     frozen: "true"
+    sync-check: "true" # Optional drift gate
 ```
+
+The action defaults to `waypost-ref: v0.2.0` and verifies prebuilt release binaries
+against `SHA256SUMS.txt`. Branch refs and unavailable release binaries use `go install`.
 
 ---
 

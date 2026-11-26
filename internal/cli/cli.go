@@ -16,6 +16,7 @@ import (
 	"github.com/Farzin312/waypost/internal/gitdiff"
 	"github.com/Farzin312/waypost/internal/lockfile"
 	"github.com/Farzin312/waypost/internal/presets"
+	"github.com/Farzin312/waypost/internal/syncer"
 	"github.com/Farzin312/waypost/internal/upgrade"
 	"github.com/Farzin312/waypost/internal/verify"
 	"github.com/Farzin312/waypost/internal/version"
@@ -44,6 +45,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		err = runContext(rest, stdout)
 	case "graph":
 		return runGraph(rest, stdout, stderr)
+	case "sync":
+		return runSync(rest, stdout, stderr)
 	case "verify":
 		return runVerify(rest, stdout, stderr)
 	case "upgrade":
@@ -72,8 +75,9 @@ func printUsage(w io.Writer) {
 Usage:
   waypost init    [--preset auto|base|app-ts|polyglot-native] [--from-bounds] [--claude-md] [--dir .] [--force]
   waypost context [--changed] [--base <ref>] [--offline] [--format text|json] [--dir .]
-  waypost graph   [--changed] [--base <ref>] [--check-boundaries] [--mermaid] [--offline] [--format text|json] [--dir .]
+  waypost graph   [--changed] [--base <ref>] [--check-boundaries] [--update-baseline] [--mermaid] [--offline] [--format text|json] [--dir .]
   waypost verify  [--mode local|ci] [--base <ref>] [--frozen] [--offline] [--all] [--receipt <path>] [--markdown <path>] [--format text|json] [--dir .]
+  waypost sync    [--apply] [--check] [--offline] [--format text|json] [--dir .]
   waypost upgrade [--target <ref>] [--dry-run] [--apply] [--offline] [--format text|json] [--dir .]
   waypost version [--format text|json]
 
@@ -460,18 +464,21 @@ type ContextOutput struct {
 	UnmappedPaths     []string                 `json:"unmapped_paths,omitempty"`
 	UnmappedTruncated int                      `json:"unmapped_truncated,omitempty"`
 	CoverageGaps      []string                 `json:"coverage_gaps,omitempty"`
+	SyncDrift         []syncer.Item            `json:"sync_drift,omitempty"`
 	Changed           *ContextChanged          `json:"changed,omitempty"`
 }
 
 type ContextArchitecture struct {
-	FilesScanned   int                    `json:"files_scanned"`
-	ImportsScanned int                    `json:"imports_scanned"`
-	ObservedEdges  int                    `json:"observed_edges"`
-	BoundariesMode string                 `json:"boundaries_mode"`
-	Hubs           []string               `json:"hubs,omitempty"`
-	CycleCount     int                    `json:"cycle_count"`
-	ViolationCount int                    `json:"violation_count"`
-	BlastRadius    *archgraph.BlastRadius `json:"blast_radius,omitempty"`
+	FilesScanned          int                    `json:"files_scanned"`
+	ImportsScanned        int                    `json:"imports_scanned"`
+	ObservedEdges         int                    `json:"observed_edges"`
+	BoundariesMode        string                 `json:"boundaries_mode"`
+	Hubs                  []string               `json:"hubs,omitempty"`
+	CycleCount            int                    `json:"cycle_count"`
+	ViolationCount        int                    `json:"violation_count"`
+	GrandfatheredCount    int                    `json:"grandfathered_count,omitempty"`
+	ResolvedBaselineCount int                    `json:"resolved_baseline_count,omitempty"`
+	BlastRadius           *archgraph.BlastRadius `json:"blast_radius,omitempty"`
 }
 
 type ContextChanged struct {
@@ -510,6 +517,7 @@ func runContext(args []string, stdout io.Writer) error {
 	}
 
 	var cfgPtr *config.Config
+	var canonical *config.ResolvedConfig
 	maxItems := 50
 
 	if _, err := os.Stat(filepath.Join(absDir, config.ConfigFileName)); err == nil {
@@ -539,7 +547,7 @@ func runContext(args []string, stdout io.Writer) error {
 		if res.Effective.Policy.MaxContextItems > 0 {
 			maxItems = res.Effective.Policy.MaxContextItems
 		}
-		canonical := res
+		canonical = res
 		if res.LocalOverrideApplied {
 			ciLoadOpts := loadOpts
 			ciLoadOpts.Mode = "ci"
@@ -585,13 +593,31 @@ func runContext(args []string, stdout io.Writer) error {
 		if rep, rErr := archgraph.Analyze(absDir, cm, bCfg); rErr == nil {
 			archRep = rep
 			out.Architecture = &ContextArchitecture{
-				FilesScanned:   rep.FilesScanned,
-				ImportsScanned: rep.ImportsScanned,
-				ObservedEdges:  len(rep.Edges),
-				BoundariesMode: rep.BoundariesMode,
-				Hubs:           rep.Hubs,
-				CycleCount:     len(rep.Cycles),
-				ViolationCount: len(rep.Violations),
+				FilesScanned:          rep.FilesScanned,
+				ImportsScanned:        rep.ImportsScanned,
+				ObservedEdges:         len(rep.Edges),
+				BoundariesMode:        rep.BoundariesMode,
+				Hubs:                  rep.Hubs,
+				CycleCount:            len(rep.Cycles),
+				ViolationCount:        len(rep.Violations),
+				GrandfatheredCount:    rep.GrandfatheredCount,
+				ResolvedBaselineCount: rep.ResolvedBaselineCount,
+			}
+		}
+	}
+
+	if canonical != nil {
+		var graph *archgraph.Report
+		if cfgPtr == &canonical.Effective && len(cfgPtr.Providers) == 0 {
+			graph = archRep
+		}
+		items, driftErr := syncer.Check(absDir, canonical, graph)
+		if driftErr != nil {
+			out.CoverageGaps = append(out.CoverageGaps, "sync drift check failed: "+driftErr.Error())
+		}
+		for _, item := range items {
+			if item.Actionable() && len(out.SyncDrift) < maxItems {
+				out.SyncDrift = append(out.SyncDrift, item)
 			}
 		}
 	}
@@ -660,6 +686,9 @@ func renderContextText(w io.Writer, o *ContextOutput) {
 		fmt.Fprintf(w, "  arch_graph: files=%d imports=%d edges=%d cycles=%d violations=%d (boundaries=%s)\n",
 			o.Architecture.FilesScanned, o.Architecture.ImportsScanned, o.Architecture.ObservedEdges,
 			o.Architecture.CycleCount, o.Architecture.ViolationCount, o.Architecture.BoundariesMode)
+		if o.Architecture.BoundariesMode == "ratchet" {
+			fmt.Fprintf(w, "  baseline: %d grandfathered, %d resolved\n", o.Architecture.GrandfatheredCount, o.Architecture.ResolvedBaselineCount)
+		}
 		if len(o.Architecture.Hubs) > 0 {
 			fmt.Fprintf(w, "  arch_hubs:  %s\n", strings.Join(o.Architecture.Hubs, ", "))
 		}
@@ -746,6 +775,13 @@ func renderContextText(w io.Writer, o *ContextOutput) {
 		}
 	}
 
+	if len(o.SyncDrift) > 0 {
+		fmt.Fprintln(w, "\nSync drift:")
+		for _, item := range o.SyncDrift {
+			fmt.Fprintf(w, "  - %s (%s)\n", item.Detail, item.Hint)
+		}
+	}
+
 	if o.Changed != nil {
 		fmt.Fprintf(w, "\nChanged Impact (base=%s, dirty=%v):\n", nonEmpty(o.Changed.BaseRef, "HEAD"), o.Changed.Dirty)
 		fmt.Fprintf(w, "  changed_paths:        %d\n", len(o.Changed.AffectedPaths))
@@ -766,6 +802,7 @@ func runGraph(args []string, stdout, stderr io.Writer) int {
 	changed := fs.Bool("changed", false, "compute file-level and component-level blast radius for git diff")
 	base := fs.String("base", "", "base git ref for --changed")
 	checkBounds := fs.Bool("check-boundaries", false, "enforce configured boundaries and exit non-zero on violations")
+	updateBaseline := fs.Bool("update-baseline", false, "replace the baseline with live violations, including an empty baseline when clean")
 	mermaid := fs.Bool("mermaid", false, "render live observed architecture as a Mermaid flowchart")
 	offline := fs.Bool("offline", false, "restrict remote preset resolution to verified local cache")
 	format := fs.String("format", "text", "output format: text or json")
@@ -797,8 +834,12 @@ func runGraph(args []string, stdout, stderr io.Writer) int {
 	var bCfg *config.BoundariesConfig
 	if _, err := os.Stat(filepath.Join(absDir, config.ConfigFileName)); err == nil {
 		existingLock, _, _ := lockfile.Read(absDir)
+		mode := "local"
+		if *updateBaseline {
+			mode = "ci"
+		}
 		res, err := config.Load(absDir, config.LoadOptions{
-			Mode:                "local",
+			Mode:                mode,
 			PinnedRemoteSHAs:    lockfile.PinnedRemoteSHAs(existingLock),
 			RequirePinnedRemote: *offline,
 			Offline:             *offline,
@@ -809,6 +850,10 @@ func runGraph(args []string, stdout, stderr io.Writer) int {
 		}
 		cfgPtr = &res.Effective
 		bCfg = res.Effective.Boundaries
+	}
+	if *updateBaseline && !bCfg.IsEnabled() {
+		fmt.Fprintln(stderr, "waypost graph: --update-baseline requires enabled boundaries")
+		return 1
 	}
 	if *checkBounds && !bCfg.IsEnabled() {
 		if bCfg == nil {
@@ -824,7 +869,12 @@ func runGraph(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	rep, err := archgraph.Analyze(absDir, cm, bCfg)
+	var rep *archgraph.Report
+	if *updateBaseline {
+		rep, err = updateGraphBaseline(absDir, cm, bCfg, stderr)
+	} else {
+		rep, err = archgraph.Analyze(absDir, cm, bCfg)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "waypost graph: %v\n", err)
 		return 1
@@ -852,10 +902,33 @@ func runGraph(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, archgraph.RenderText(rep))
 	}
 
-	if *checkBounds && len(rep.Violations) > 0 && bCfg.EffectiveMode() == "enforce" {
+	if *checkBounds && len(rep.Violations) > 0 && bCfg.EffectiveMode() != "warn" {
 		return 1
 	}
 	return 0
+}
+
+func updateGraphBaseline(repo string, cm *compmap.Map, boundaries *config.BoundariesConfig, stderr io.Writer) (*archgraph.Report, error) {
+	report, err := archgraph.AnalyzeLive(repo, cm, boundaries, archgraph.AnalyzeOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if len(report.ScanErrors) > 0 {
+		return nil, fmt.Errorf("cannot update baseline after an incomplete scan: %s", report.ScanErrors[0])
+	}
+	rel := boundaries.BaselinePath()
+	if err := archgraph.SaveBaseline(repo, rel, report.Violations); err != nil {
+		return nil, err
+	}
+	baseline, err := archgraph.LoadBaseline(repo, rel)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(stderr, "waypost graph: wrote %d baseline entries to %s\n", len(baseline.Entries), rel)
+	if report.BoundariesMode == "ratchet" {
+		archgraph.EvaluateBoundariesWithBaseline(report, baseline)
+	}
+	return report, nil
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {

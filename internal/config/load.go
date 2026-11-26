@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,6 +190,12 @@ func Load(repoDir string, opts LoadOptions) (*ResolvedConfig, error) {
 
 	if err := validateEffective(&effective); err != nil {
 		return nil, err
+	}
+
+	if b := effective.Boundaries; b != nil && (b.Baseline != "" || b.EffectiveMode() == "ratchet") && opts.RepoFileReader == nil {
+		if err := ValidateBaselinePath(absRepo, b.BaselinePath()); err != nil {
+			return nil, err
+		}
 	}
 
 	digest, err := ComputeDigest(effective)
@@ -405,8 +412,8 @@ func validateSingle(cfg *Config, label string) error {
 		}
 	}
 	if bounds := cfg.Boundaries; bounds != nil {
-		if bounds.Mode != "" && bounds.Mode != "enforce" && bounds.Mode != "warn" {
-			return fmt.Errorf("%s: boundaries.mode %q must be %q or %q", label, bounds.Mode, "enforce", "warn")
+		if bounds.Mode != "" && bounds.Mode != "enforce" && bounds.Mode != "ratchet" && bounds.Mode != "warn" {
+			return fmt.Errorf("%s: boundaries.mode %q must be enforce, ratchet, or warn", label, bounds.Mode)
 		}
 		if err := checkDuplicateIDs(label, "boundary rule", len(bounds.Rules), func(i int) string { return bounds.Rules[i].ID }); err != nil {
 			return err
@@ -429,6 +436,46 @@ func validateSingle(cfg *Config, label string) error {
 				return fmt.Errorf("%s: boundary rule %q requires a dependency or public entrypoint constraint", label, rule.ID)
 			}
 		}
+	}
+	return nil
+}
+
+func validBaselinePath(rel string) bool {
+	if !fs.ValidPath(rel) || strings.ContainsAny(rel, "\\:\x00") {
+		return false
+	}
+	first, _, _ := strings.Cut(strings.ToLower(rel), "/")
+	switch first {
+	case ".", ".git", ConfigFileName, LocalConfigFileName, ".waypost.lock":
+		return false
+	default:
+		return true
+	}
+}
+
+// ValidateBaselinePath accepts a missing file but rejects an existing path that
+// resolves outside the repository, including a symlink in a parent directory.
+func ValidateBaselinePath(repo, rel string) error {
+	if !validBaselinePath(rel) || !filepath.IsLocal(rel) {
+		return fmt.Errorf("boundaries.baseline %q must be a repository-relative file path", rel)
+	}
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	for prefix := filepath.FromSlash(rel); prefix != "."; prefix = filepath.Dir(prefix) {
+		_, err := root.Stat(prefix)
+		if errors.Is(err, os.ErrNotExist) {
+			// Lstat distinguishes a broken link from a missing path.
+			if _, linkErr := root.Lstat(prefix); errors.Is(linkErr, os.ErrNotExist) {
+				continue
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("boundaries.baseline %q: %w", rel, err)
+		}
+		break
 	}
 	return nil
 }
@@ -554,6 +601,9 @@ func mergeBoundaries(parent, child *BoundariesConfig) *BoundariesConfig {
 	}
 	if child.Mode != "" {
 		out.Mode = child.Mode
+	}
+	if child.Baseline != "" {
+		out.Baseline = child.Baseline
 	}
 	if child.NoCycles != nil {
 		out.NoCycles = child.NoCycles

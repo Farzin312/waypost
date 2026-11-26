@@ -57,7 +57,7 @@ components:
     root: internal/cli
     kind: package
     language: go
-    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "presets", "upgrade", "verify", "version"]
+    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile", "presets", "syncer", "upgrade", "verify", "version"]
     paths: ["internal/cli/**"]
     checks: ["go-vet", "go-test-race"]
   - id: archgraph
@@ -116,7 +116,7 @@ components:
     root: internal/policy
     kind: package
     language: go
-    depends_on: ["compmap", "config", "gitdiff", "lockfile"]
+    depends_on: ["archgraph", "compmap", "config", "gitdiff", "lockfile"]
     paths: ["internal/policy/**"]
     checks: ["go-vet", "go-test-race"]
   - id: verify
@@ -156,6 +156,15 @@ components:
     kind: documentation
     language: markdown
     paths: ["docs/**", "examples/**", "README.md", "AGENTS.md", "LICENSE", ".gitignore", ".github/**", ".waypost.yaml", ".waypost.lock", "go.mod", "go.sum"]
+  - id: syncer
+    root: internal/syncer
+    language: go
+    depends_on:
+      - archgraph
+      - compmap
+      - config
+      - lockfile
+      - upgrade
 checks:
   - id: go-vet
     command: "go vet ./..."

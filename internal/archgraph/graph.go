@@ -48,24 +48,35 @@ type NodeMetrics struct {
 	UndeclaredImports  []string `json:"undeclared_imports,omitempty"`
 }
 
-// CycleWitness records a circular component import cycle with concrete file:line hops.
+// CycleEdge is a directed import between two members of a cyclic component group.
+type CycleEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// CycleWitness records a cyclic component group and one concrete cycle through it.
 type CycleWitness struct {
+	Members   []string     `json:"members"`
+	Edges     []CycleEdge  `json:"edges"`
 	Path      []string     `json:"path"`
 	Witnesses []ImportSite `json:"witnesses,omitempty"`
 }
 
 // Violation represents one concrete architectural boundary breach with exact file:line location.
 type Violation struct {
-	RuleID     string `json:"rule_id"`
-	Kind       string `json:"kind"`     // "cycle" | "undeclared-dependency" | "disallowed-dependency" | "denied-dependency" | "private-import"
-	Severity   string `json:"severity"` // "error" | "warn"
-	From       string `json:"from"`
-	To         string `json:"to,omitempty"`
-	File       string `json:"file,omitempty"`
-	Line       int    `json:"line,omitempty"`
-	Specifier  string `json:"specifier,omitempty"`
-	TargetFile string `json:"target_file,omitempty"`
-	Message    string `json:"message"`
+	RuleID       string      `json:"rule_id"`
+	Kind         string      `json:"kind"`     // "cycle" | "undeclared-dependency" | "disallowed-dependency" | "denied-dependency" | "private-import"
+	Severity     string      `json:"severity"` // "error" | "warn"
+	From         string      `json:"from"`
+	To           string      `json:"to,omitempty"`
+	File         string      `json:"file,omitempty"`
+	Line         int         `json:"line,omitempty"`
+	Specifier    string      `json:"specifier,omitempty"`
+	TargetFile   string      `json:"target_file,omitempty"`
+	Message      string      `json:"message"`
+	CyclePath    []string    `json:"cycle_path,omitempty"`
+	CycleMembers []string    `json:"cycle_members,omitempty"`
+	CycleEdges   []CycleEdge `json:"cycle_edges,omitempty"`
 }
 
 // BlastRadius reports file-level and component-level reverse impact for a set of changed files.
@@ -79,21 +90,24 @@ type BlastRadius struct {
 
 // Report is the complete live code architecture & boundary analysis result.
 type Report struct {
-	FilesScanned   int             `json:"files_scanned"`
-	ImportsScanned int             `json:"imports_scanned"`
-	BoundariesMode string          `json:"boundaries_mode,omitempty"` // "enforce" | "warn" | "off"
-	Nodes          []NodeMetrics   `json:"nodes"`
-	Edges          []ComponentEdge `json:"edges,omitempty"`
-	Cycles         []CycleWitness  `json:"cycles,omitempty"`
-	Violations     []Violation     `json:"violations,omitempty"`
-	ScanErrors     []string        `json:"scan_errors,omitempty"`
-	Hubs           []string        `json:"hubs,omitempty"`
-	Blast          *BlastRadius    `json:"blast_radius,omitempty"`
+	FilesScanned          int             `json:"files_scanned"`
+	ImportsScanned        int             `json:"imports_scanned"`
+	BoundariesMode        string          `json:"boundaries_mode,omitempty"` // "enforce" | "ratchet" | "warn" | "off"
+	Nodes                 []NodeMetrics   `json:"nodes"`
+	Edges                 []ComponentEdge `json:"edges,omitempty"`
+	Cycles                []CycleWitness  `json:"cycles,omitempty"`
+	Violations            []Violation     `json:"violations,omitempty"`
+	GrandfatheredCount    int             `json:"grandfathered_count,omitempty"`
+	ResolvedBaselineCount int             `json:"resolved_baseline_count,omitempty"`
+	ScanErrors            []string        `json:"scan_errors,omitempty"`
+	Hubs                  []string        `json:"hubs,omitempty"`
+	Blast                 *BlastRadius    `json:"blast_radius,omitempty"`
 
 	// internal lookup maps for BlastRadius computation
-	rawImports []RawImport
-	fileOwner  map[string]string
-	revCompAdj map[string][]string
+	grandfathered []Violation
+	rawImports    []RawImport
+	fileOwner     map[string]string
+	revCompAdj    map[string][]string
 }
 
 // Analyze scans source imports statically across TS/JS, Go, Python, and Rust, maps them
@@ -104,6 +118,26 @@ func Analyze(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfi
 }
 
 func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfig, opts AnalyzeOptions) (*Report, error) {
+	report, err := AnalyzeLive(repoDir, cm, boundaries, opts)
+	if err != nil || report.BoundariesMode != "ratchet" {
+		return report, err
+	}
+	read := opts.BaselineReader
+	if read == nil {
+		read = func(relPath string) (*BaselineFile, error) { return LoadBaseline(repoDir, relPath) }
+	}
+	baseline, err := read(boundaries.BaselinePath())
+	if err != nil {
+		report.addBaselineError(boundaries.BaselinePath(), err)
+	} else {
+		EvaluateBoundariesWithBaseline(report, baseline)
+	}
+	return report, nil
+}
+
+// AnalyzeLive scans raw violations before comparing them to any baseline.
+// Explicit baseline updates and trusted Git verification supply their own baseline.
+func AnalyzeLive(repoDir string, cm *compmap.Map, boundaries *config.BoundariesConfig, opts AnalyzeOptions) (*Report, error) {
 	absRepo, err := filepath.Abs(repoDir)
 	if err != nil {
 		return nil, err
@@ -283,7 +317,7 @@ func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.Boun
 	severity := "warn"
 	if boundaries.IsEnabled() {
 		mode = boundaries.EffectiveMode()
-		if mode == "enforce" {
+		if mode != "warn" {
 			severity = "error"
 		}
 	}
@@ -299,13 +333,17 @@ func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.Boun
 		// 1. Cycle rule
 		if config.BoolVal(boundaries.NoCycles, true) {
 			for _, cyc := range cycles {
-				msg := "circular component import cycle: " + strings.Join(cyc.Path, " -> ")
+				msg := fmt.Sprintf("circular component import cycle: %s (cyclic components: %s)",
+					strings.Join(cyc.Path, " -> "), strings.Join(cyc.Members, ", "))
 				v := Violation{
-					RuleID:   "no-cycles",
-					Kind:     "cycle",
-					Severity: severity,
-					From:     cyc.Path[0],
-					Message:  msg,
+					RuleID:       "no-cycles",
+					Kind:         "cycle",
+					Severity:     severity,
+					From:         cyc.Members[0],
+					CyclePath:    cyc.Path,
+					CycleMembers: cyc.Members,
+					CycleEdges:   cyc.Edges,
+					Message:      msg,
 				}
 				if len(cyc.Witnesses) > 0 {
 					w := cyc.Witnesses[0]
@@ -343,11 +381,11 @@ func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.Boun
 		for _, imp := range ownedImports {
 			fromComp, toComp := imp.from, imp.to
 			for _, rule := range boundaries.Rules {
-				if rule.From != "" && matchComponentPattern(rule.From, fromComp) {
+				if rule.From != "" && MatchesComponentPattern(rule.From, fromComp) {
 					if rule.AllowDependsOn != nil {
 						allowed := false
 						for _, pat := range *rule.AllowDependsOn {
-							if matchComponentPattern(pat, toComp) {
+							if MatchesComponentPattern(pat, toComp) {
 								allowed = true
 								break
 							}
@@ -372,7 +410,7 @@ func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.Boun
 						}
 					}
 					for _, pat := range rule.DenyDependsOn {
-						if matchComponentPattern(pat, toComp) {
+						if MatchesComponentPattern(pat, toComp) {
 							reason := rule.Reason
 							if reason == "" {
 								reason = fmt.Sprintf("component %q must not depend on %q", fromComp, toComp)
@@ -393,8 +431,8 @@ func AnalyzeWithOptions(repoDir string, cm *compmap.Map, boundaries *config.Boun
 						}
 					}
 				}
-				if rule.Target != "" && len(rule.PublicEntrypoints) > 0 && matchComponentPattern(rule.Target, toComp) {
-					if rule.From != "" && !matchComponentPattern(rule.From, fromComp) {
+				if rule.Target != "" && len(rule.PublicEntrypoints) > 0 && MatchesComponentPattern(rule.Target, toComp) {
+					if rule.From != "" && !MatchesComponentPattern(rule.From, fromComp) {
 						continue
 					}
 					if !isPublicImport(rule.PublicEntrypoints, imp.RawImport, toComp, scan.goPackages, fileOwner) {
@@ -581,7 +619,8 @@ func primaryOwnerOf(cm *compmap.Map, relFile string) string {
 	return best.ID
 }
 
-func matchComponentPattern(pattern, compID string) bool {
+// MatchesComponentPattern reports whether a boundary selector matches a component ID.
+func MatchesComponentPattern(pattern, compID string) bool {
 	if pattern == "*" || pattern == "**" || pattern == compID {
 		return true
 	}
@@ -611,55 +650,98 @@ func detectObservedCycles(nodes []NodeMetrics, witnessFn func(u, v string) (Impo
 	for _, n := range nodes {
 		adj[n.ID] = n.ObservedDependsOn
 	}
-	const (
-		white = 0
-		gray  = 1
-		black = 2
-	)
-	color := make(map[string]int, len(nodes))
-	seen := make(map[string]bool)
-	var cycles []CycleWitness
 
-	var dfs func(u string, stack []string)
-	dfs = func(u string, stack []string) {
-		color[u] = gray
+	// Tarjan's algorithm. A node stays on the stack until its entire
+	// strongly connected component has been identified.
+	index := make(map[string]int, len(nodes))
+	low := make(map[string]int, len(nodes))
+	onStack := make(map[string]bool, len(nodes))
+	stack := make([]string, 0, len(nodes))
+	var cycles []CycleWitness
+	var visit func(string)
+	visit = func(u string) {
+		index[u] = len(index) + 1
+		low[u] = index[u]
+		onStack[u] = true
 		stack = append(stack, u)
 		for _, v := range adj[u] {
-			switch color[v] {
-			case gray:
-				for i, node := range stack {
-					if node == v {
-						path := append(append([]string(nil), stack[i:]...), v)
-						key := strings.Join(path, "->")
-						if !seen[key] {
-							seen[key] = true
-							var wits []ImportSite
-							for j := 0; j < len(path)-1; j++ {
-								if s, ok := witnessFn(path[j], path[j+1]); ok {
-									wits = append(wits, s)
-								}
-							}
-							cycles = append(cycles, CycleWitness{Path: path, Witnesses: wits})
-						}
-						break
-					}
-				}
-			case white:
-				dfs(v, stack)
+			if index[v] == 0 {
+				visit(v)
+				low[u] = min(low[u], low[v])
+			} else if onStack[v] {
+				low[u] = min(low[u], index[v])
 			}
 		}
-		color[u] = black
+		if low[u] != index[u] {
+			return
+		}
+
+		start := len(stack) - 1
+		for stack[start] != u {
+			start--
+		}
+		members := slices.Clone(stack[start:])
+		stack = stack[:start]
+		for _, member := range members {
+			onStack[member] = false
+		}
+		if len(members) > 1 || slices.Contains(adj[u], u) {
+			cycles = append(cycles, describeCycle(adj, members, witnessFn))
+		}
 	}
 
 	for _, n := range nodes {
-		if color[n.ID] == white {
-			dfs(n.ID, nil)
+		if index[n.ID] == 0 {
+			visit(n.ID)
 		}
 	}
-	sort.Slice(cycles, func(i, j int) bool {
-		return strings.Join(cycles[i].Path, "->") < strings.Join(cycles[j].Path, "->")
-	})
+	slices.SortFunc(cycles, func(a, b CycleWitness) int { return slices.Compare(a.Members, b.Members) })
 	return cycles
+}
+
+func describeCycle(adj map[string][]string, members []string, witnessFn func(u, v string) (ImportSite, bool)) CycleWitness {
+	slices.Sort(members)
+	internal := make(map[string][]string, len(members))
+	for _, u := range members {
+		internal[u] = nil
+	}
+	cycle := CycleWitness{Members: members}
+	for _, u := range members {
+		for _, v := range adj[u] {
+			if _, ok := internal[v]; ok {
+				internal[u] = append(internal[u], v)
+				cycle.Edges = append(cycle.Edges, CycleEdge{From: u, To: v})
+			}
+		}
+	}
+	sortCycleEdges(cycle.Edges)
+
+	// Keep a real directed path for diagnostics. The first internal edge
+	// has a return path because both endpoints are in the same SCC.
+	first := cycle.Edges[0]
+	parent := map[string]string{first.To: ""}
+	queue := []string{first.To}
+	for i := 0; i < len(queue) && queue[i] != first.From; i++ {
+		u := queue[i]
+		for _, v := range internal[u] {
+			if _, seen := parent[v]; !seen {
+				parent[v] = u
+				queue = append(queue, v)
+			}
+		}
+	}
+	for u := first.From; u != first.To; u = parent[u] {
+		cycle.Path = append(cycle.Path, u)
+	}
+	cycle.Path = append(cycle.Path, first.To)
+	slices.Reverse(cycle.Path)
+	cycle.Path = append([]string{first.From}, cycle.Path...)
+	for i := 1; i < len(cycle.Path); i++ {
+		if w, ok := witnessFn(cycle.Path[i-1], cycle.Path[i]); ok {
+			cycle.Witnesses = append(cycle.Witnesses, w)
+		}
+	}
+	return cycle
 }
 
 // RenderMermaid formats the live observed architecture graph as a clean Mermaid flowchart.
@@ -701,6 +783,9 @@ func RenderText(r *Report) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Waypost Architecture Graph (files=%d, imports=%d, edges=%d, cycles=%d, violations=%d, boundaries=%s)\n",
 		r.FilesScanned, r.ImportsScanned, len(r.Edges), len(r.Cycles), len(r.Violations), r.BoundariesMode))
+	if r.BoundariesMode == "ratchet" {
+		fmt.Fprintf(&b, "  baseline: %d grandfathered, %d resolved\n", r.GrandfatheredCount, r.ResolvedBaselineCount)
+	}
 	if len(r.Hubs) > 0 {
 		b.WriteString(fmt.Sprintf("  high_fan_in_hubs: %s\n", strings.Join(r.Hubs, ", ")))
 	}
@@ -725,7 +810,7 @@ func RenderText(r *Report) string {
 	if len(r.Cycles) > 0 {
 		b.WriteString(fmt.Sprintf("\nLive Import Cycles (%d):\n", len(r.Cycles)))
 		for _, c := range r.Cycles {
-			b.WriteString("  - " + strings.Join(c.Path, " -> ") + "\n")
+			fmt.Fprintf(&b, "  - %s (witness: %s)\n", strings.Join(c.Members, ", "), strings.Join(c.Path, " -> "))
 			for _, w := range c.Witnesses {
 				b.WriteString(fmt.Sprintf("      at %s:%d (%q -> %s)\n", w.File, w.Line, w.Specifier, w.TargetFile))
 			}

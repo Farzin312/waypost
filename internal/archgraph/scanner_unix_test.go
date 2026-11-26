@@ -42,3 +42,21 @@ func TestBoundedReaderRejectsPipesAndSockets(t *testing.T) {
 		t.Fatalf("FIFO manifest scan: %v, %+v", err, report)
 	}
 }
+
+func TestBaselineAndBoundsMigrationRejectLegacyFIFO(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, ".bounds/manifests/app.yaml"), "paths: [src/app]\n")
+	pipe := filepath.Join(dir, ".bounds/ignore")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MigrateFromBounds(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("migration accepted FIFO: %v", err)
+	}
+	if _, err := LoadBaseline(dir, ".bounds/ignore"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("baseline accepted FIFO: %v", err)
+	}
+	if err := SaveBaseline(dir, ".bounds/ignore", nil); err == nil {
+		t.Fatal("baseline update replaced a FIFO")
+	}
+}

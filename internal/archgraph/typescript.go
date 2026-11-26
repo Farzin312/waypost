@@ -217,7 +217,6 @@ func extractTSImports(src []byte) []parsedRef {
 		tokens = append(tokens, tok)
 	}
 	var refs []parsedRef
-	seen := make(map[parsedRef]bool)
 	for i, tok := range tokens {
 		if tok.kind != 'i' || (i > 0 && tokens[i-1].kind == '.') {
 			continue
@@ -225,11 +224,7 @@ func extractTSImports(src []byte) []parsedRef {
 		switch tok.text {
 		case "import", "export", "require":
 			if spec := tsImportSpecifier(tok.text, tokens[i+1:]); spec != "" {
-				ref := parsedRef{line: tok.line, spec: spec}
-				if !seen[ref] {
-					seen[ref] = true
-					refs = append(refs, ref)
-				}
+				refs = append(refs, parsedRef{line: tok.line, spec: spec})
 			}
 		}
 	}

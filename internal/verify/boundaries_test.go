@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Farzin312/waypost/internal/archgraph"
+	"github.com/Farzin312/waypost/internal/compmap"
 	"github.com/Farzin312/waypost/internal/config"
 	"github.com/Farzin312/waypost/internal/lockfile"
 )
@@ -312,5 +314,302 @@ func gitBoundaryFixture(t *testing.T, dir string, args ...string) {
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func TestCIRatchetTrustedBaseline(t *testing.T) {
+	const clean = "export const x = 1;\n"
+	const violating = "import '../api/index';\n"
+	const baselinePath = "policy/baseline[1].json"
+	for _, tc := range []struct {
+		name, baseMode, headMode, action, wantStatus, finding string
+	}{
+		{"grandfathered", "ratchet", "ratchet", "", StatusPass, ""},
+		{"line shift", "ratchet", "ratchet", "shift", StatusPass, ""},
+		{"net new", "ratchet", "ratchet", "new", StatusFail, ""},
+		{"fingerprint expansion", "ratchet", "ratchet", "expand", StatusFail, "expanded boundary baseline"},
+		{"expansion with component remap", "ratchet", "ratchet", "remap", StatusFail, "expanded boundary baseline"},
+		{"expansion with a renamed baseline", "ratchet", "ratchet", "rename", StatusFail, "expanded boundary baseline"},
+		{"fingerprint expansion without live violation", "ratchet", "ratchet", "expand-unused", StatusFail, "expanded boundary baseline"},
+		{"resolved fingerprint removed", "ratchet", "ratchet", "shrink", StatusPass, ""},
+		{"graduation and deletion", "ratchet", "enforce", "graduate", StatusPass, ""},
+		{"ratchet downgrade with no live violations", "ratchet", "warn", "graduate", StatusFail, "from ratchet to warn"},
+		{"enforce downgrade with no live violations", "enforce", "ratchet", "seed", StatusFail, "from enforce to ratchet"},
+		{"warn upgraded to ratchet", "warn", "ratchet", "seed", StatusPass, ""},
+		{"missing head baseline", "ratchet", "ratchet", "delete", StatusFail, ""},
+		{"corrupt head baseline", "ratchet", "ratchet", "corrupt", StatusFail, "boundary baseline"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := func(mode, rel string) string {
+				return fmt.Sprintf(`schema_version: "1"
+boundaries:
+  enabled: true
+  mode: %s
+  baseline: "%s"
+  rules:
+    - id: web-no-api
+      from: web
+      deny_depends_on: [api]
+components:
+  - id: api
+    root: src/api
+  - id: web
+    root: src/web
+`, mode, rel)
+			}
+			writeBoundaryFixture(t, dir, config.ConfigFileName, cfg(tc.baseMode, baselinePath))
+			writeBoundaryFixture(t, dir, "src/api/index.ts", clean)
+			old := violating
+			if tc.baseMode == "enforce" {
+				old = clean
+			}
+			writeBoundaryFixture(t, dir, "src/web/old.ts", old)
+			writeBoundaryFixture(t, dir, "src/web/older.ts", old)
+			if tc.baseMode == "ratchet" {
+				seedBoundaryFixture(t, dir, baselinePath)
+			}
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "init", "-b", "main")
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "base")
+			gitBoundaryFixture(t, dir, "checkout", "-b", "pr")
+
+			headPath := baselinePath
+			if tc.action == "rename" {
+				headPath = "policy/moved.json"
+			}
+			writeBoundaryFixture(t, dir, config.ConfigFileName, cfg(tc.headMode, headPath))
+			switch tc.action {
+			case "shift":
+				writeBoundaryFixture(t, dir, "src/web/old.ts", "\n// moved\n\n"+violating)
+			case "new", "expand", "remap", "rename", "expand-unused":
+				writeBoundaryFixture(t, dir, "src/web/new.ts", violating)
+				if tc.action != "new" {
+					seedBoundaryFixture(t, dir, headPath)
+				}
+				if tc.action == "expand-unused" {
+					writeBoundaryFixture(t, dir, "src/web/new.ts", clean)
+				}
+				if tc.action == "remap" {
+					writeBoundaryFixture(t, dir, config.ConfigFileName, strings.ReplaceAll(cfg(tc.headMode, headPath), "root: src/web", "root: src/reassigned"))
+				}
+			case "shrink":
+				writeBoundaryFixture(t, dir, "src/web/old.ts", clean)
+				seedBoundaryFixture(t, dir, headPath)
+			case "graduate":
+				writeBoundaryFixture(t, dir, "src/web/old.ts", clean)
+				writeBoundaryFixture(t, dir, "src/web/older.ts", clean)
+				fallthrough
+			case "delete":
+				if err := os.Remove(filepath.Join(dir, baselinePath)); err != nil {
+					t.Fatal(err)
+				}
+			case "seed":
+				seedBoundaryFixture(t, dir, headPath)
+			case "corrupt":
+				writeBoundaryFixture(t, dir, headPath, "{}")
+			}
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "--allow-empty", "-m", "pr")
+
+			rec, err := Run(dir, Options{Mode: "ci", Frozen: true, Base: "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := onlyBoundaryCheck(t, rec)
+			if rec.Summary.Outcome != tc.wantStatus || check.Status != tc.wantStatus || !check.Required || !check.FromBaseFloor {
+				t.Fatalf("want %s from base floor, got %+v with policy %+v", tc.wantStatus, check, rec.Policy)
+			}
+			findings := strings.Join(rec.Policy.TamperingFindings, "\n")
+			if (tc.finding == "" && findings != "") || (tc.finding != "" && !strings.Contains(findings, tc.finding)) {
+				t.Fatalf("expected finding %q, got %q", tc.finding, findings)
+			}
+			switch tc.action {
+			case "new", "expand", "remap", "rename":
+				if !strings.Contains(check.OutputExcerpt, "src/web/new.ts") || strings.Contains(check.OutputExcerpt, "src/web/older.ts") {
+					t.Fatalf("base floor did not surface only the new violation: %+v", check)
+				}
+			case "", "shift":
+				if !strings.Contains(check.Reason, "2 grandfathered") {
+					t.Fatalf("missing grandfathered count: %+v", check)
+				}
+			case "shrink":
+				if !strings.Contains(strings.Join(rec.Policy.EscalationReasons, "\n"), baselinePath) {
+					t.Fatalf("custom baseline was not a trust path: %+v", rec.Policy)
+				}
+			}
+		})
+	}
+}
+
+func TestCIRatchetCycleIdentity(t *testing.T) {
+	const baseline = config.DefaultBaselinePath
+	for _, tc := range []struct {
+		name, a, b, c, extra, want string
+	}{
+		{"larger SCC", "import '../b/index';", "import '../a/zzz';", "import '../b/index';", "", StatusFail},
+		{"earlier witness", "import '../b/index';", "import '../a/zzz';", "", "import '../b/index';", StatusPass},
+		{"new edge within SCC", "import '../b/index';", "import '../c/index';", "import '../a/zzz';", "import '../c/index';", StatusFail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeBoundaryFixture(t, dir, config.ConfigFileName, `schema_version: '1'
+boundaries: {enabled: true, mode: ratchet}
+components: [{id: a, root: src/a}, {id: b, root: src/b}, {id: c, root: src/c}]
+`)
+			writeBoundaryFixture(t, dir, "src/a/zzz.ts", tc.a)
+			writeBoundaryFixture(t, dir, "src/b/index.ts", tc.b)
+			initialC := tc.c
+			if tc.name == "larger SCC" {
+				initialC = ""
+			}
+			writeBoundaryFixture(t, dir, "src/c/index.ts", initialC)
+			seedBoundaryFixture(t, dir, baseline)
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "init", "-b", "main")
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "base")
+			gitBoundaryFixture(t, dir, "checkout", "-b", "pr")
+			if tc.name == "larger SCC" {
+				writeBoundaryFixture(t, dir, "src/a/zzz.ts", tc.a+"\nimport '../c/index';")
+				writeBoundaryFixture(t, dir, "src/c/index.ts", tc.c)
+			} else {
+				writeBoundaryFixture(t, dir, "src/a/aaa.ts", tc.extra)
+			}
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "pr")
+			rec, err := Run(dir, Options{Mode: "ci", Frozen: true, Base: "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := onlyBoundaryCheck(t, rec)
+			wantReason := "1 boundary violation(s)"
+			if tc.want == StatusPass {
+				wantReason = "1 grandfathered"
+			}
+			if rec.Summary.Outcome != tc.want || check.Status != tc.want || !strings.Contains(check.Reason, wantReason) {
+				t.Fatalf("want %s with %s, got %+v", tc.want, wantReason, check)
+			}
+		})
+	}
+}
+
+func TestCIRatchetCountsRepeatedImportsAndRejectsCountExpansion(t *testing.T) {
+	const baseline = config.DefaultBaselinePath
+	const violating = "import '../api/index';"
+	for _, tc := range []struct {
+		name, imports string
+		expand        bool
+	}{
+		{"extra imports on separate lines", strings.Repeat(violating+"\n", 3), false},
+		{"extra imports on the same line", strings.Repeat(violating+" ", 3), false},
+		{"count expansion", strings.Repeat(violating+"\n", 3), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeBoundaryFixture(t, dir, config.ConfigFileName, `schema_version: '1'
+boundaries: {enabled: true, mode: ratchet, enforce_declared_deps: true}
+components: [{id: api, root: api}, {id: web, root: web}]
+`)
+			writeBoundaryFixture(t, dir, "api/index.ts", "export const a = 1;")
+			writeBoundaryFixture(t, dir, "web/index.ts", violating)
+			seedBoundaryFixture(t, dir, baseline)
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "init", "-b", "main")
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "base")
+			gitBoundaryFixture(t, dir, "checkout", "-b", "pr")
+			writeBoundaryFixture(t, dir, "web/index.ts", tc.imports)
+			if tc.expand {
+				seedBoundaryFixture(t, dir, baseline)
+			}
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "pr")
+			rec, err := Run(dir, Options{Mode: "ci", Frozen: true, Base: "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := onlyBoundaryCheck(t, rec)
+			if rec.Summary.Outcome != StatusFail || check.Status != StatusFail ||
+				!strings.Contains(check.Reason, "2 boundary violation(s)") {
+				t.Fatalf("want both excess imports to fail CI, got %+v", check)
+			}
+			findings := strings.Join(rec.Policy.TamperingFindings, "\n")
+			if tc.expand != strings.Contains(findings, "expanded boundary baseline") {
+				t.Fatalf("expand=%t, findings=%q", tc.expand, findings)
+			}
+		})
+	}
+}
+
+func TestCIRejectsUncommittedAndInvalidGitBaselines(t *testing.T) {
+	for _, tc := range []string{"ignored", "symlink", "malformed base", "missing base", "oversized base"} {
+		t.Run(tc, func(t *testing.T) {
+			dir := t.TempDir()
+			baseMode := "warn"
+			if strings.HasSuffix(tc, "base") {
+				baseMode = "ratchet"
+			}
+			cfg := func(mode string) string {
+				return "schema_version: '1'\nboundaries: {enabled: true, mode: " + mode + "}\n"
+			}
+			writeBoundaryFixture(t, dir, config.ConfigFileName, cfg(baseMode))
+			switch tc {
+			case "ignored":
+				writeBoundaryFixture(t, dir, ".gitignore", config.DefaultBaselinePath+"\n")
+			case "malformed base":
+				writeBoundaryFixture(t, dir, config.DefaultBaselinePath, "{}")
+			case "oversized base":
+				writeBoundaryFixture(t, dir, config.DefaultBaselinePath, strings.Repeat(" ", archgraph.MaxBaselineBytes+1))
+			}
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "init", "-b", "main")
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "base")
+			gitBoundaryFixture(t, dir, "checkout", "-b", "pr")
+			writeBoundaryFixture(t, dir, config.ConfigFileName, cfg("ratchet"))
+			switch tc {
+			case "ignored":
+				seedBoundaryFixture(t, dir, config.DefaultBaselinePath)
+			case "symlink":
+				seedBoundaryFixture(t, dir, "other.json")
+				if err := os.Symlink("other.json", filepath.Join(dir, config.DefaultBaselinePath)); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			default:
+				seedBoundaryFixture(t, dir, config.DefaultBaselinePath)
+			}
+			writeBoundaryLock(t, dir)
+			gitBoundaryFixture(t, dir, "add", ".")
+			gitBoundaryFixture(t, dir, "commit", "-m", "pr")
+			rec, err := Run(dir, Options{Mode: "ci", Base: "main", Frozen: true})
+			if err != nil || rec.Summary.Outcome != StatusFail {
+				t.Fatalf("CI accepted untrusted baseline: %+v, %v", rec, err)
+			}
+			if strings.HasSuffix(tc, "base") && !strings.Contains(strings.Join(rec.Policy.PreflightFailures, "\n"), "trusted base boundary baseline") {
+				t.Fatalf("expected base baseline preflight failure: %+v", rec.Policy)
+			}
+		})
+	}
+}
+
+func seedBoundaryFixture(t *testing.T, dir, rel string) {
+	t.Helper()
+	res, err := config.Load(dir, config.LoadOptions{Mode: "ci"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm, err := compmap.Build(dir, &res.Effective, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := archgraph.AnalyzeLive(dir, cm, res.Effective.Boundaries, archgraph.AnalyzeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archgraph.SaveBaseline(dir, rel, report.Violations); err != nil {
+		t.Fatal(err)
 	}
 }
